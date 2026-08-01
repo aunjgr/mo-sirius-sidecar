@@ -2,7 +2,8 @@
 #
 # All stages use Debian Trixie for consistency.
 # MO is built without CUDA (standard CPU build).
-# The sidecar is built with CUDA 13 via pixi (tae_scanner + httpserver + sirius).
+# The sidecar is built with CUDA 13 via pixi
+# (tae_scanner + httpserver + substrait + sirius).
 # mo-tpch is shipped with a pre-built dbgen at /opt/mo-tpch.
 #
 # Build:
