@@ -42,10 +42,11 @@ See [DESIGN.md §13](DESIGN.md#13-gpu-native-tae-scan-sirius) for full architect
 |-----------|--------|-------------|
 | **tae-scanner** | [duckdb-tae-scanner](https://github.com/matrixorigin/duckdb-tae-scanner) | Reads MatrixOne TAE storage objects as DuckDB table functions |
 | **httpserver** | [duckdb-httpserver](https://github.com/matrixorigin/duckdb-httpserver) | DuckDB HTTP server for accepting SQL queries |
+| **substrait** | [duckdb-substrait](https://github.com/matrixorigin/duckdb-substrait) | Imports and exports Substrait query plans (GPU build only) |
 | **sirius** | [sirius](https://github.com/matrixorigin/sirius) | GPU-accelerated SQL execution via cuCascade/cuDF |
 
 Extensions are statically linked into the DuckDB binary — no manual `LOAD` needed.
-The GPU build adds Sirius on top of the base extensions.
+The GPU build adds Substrait and Sirius on top of the base extensions.
 
 ## Prerequisites
 
@@ -86,7 +87,8 @@ Artifacts:
 - `build/release/duckdb` — DuckDB shell with all extensions linked
 - `build/release/extension/tae_scanner/tae_scanner.duckdb_extension` — loadable
 - `build/release/extension/httpserver/httpserver.duckdb_extension` — loadable
-- `build/release/extension/sirius/sirius.duckdb_extension` — loadable (GPU build only)
+- `build/release-gpu/extension/substrait/substrait.duckdb_extension` — loadable (GPU build only)
+- `build/release-gpu/extension/sirius/sirius.duckdb_extension` — loadable (GPU build only)
 
 ### GPU build (requires CUDA)
 
@@ -131,7 +133,8 @@ cd sirius && pixi run -- bash -c "
 > **Note:** On machines without an NVIDIA GPU the build succeeds but the
 > binary will print "NVML not available" and refuse GPU queries at runtime.
 
-This adds the Sirius GPU execution engine on top of tae_scanner + httpserver.
+This adds the Substrait plan extension and Sirius GPU execution engine on top
+of tae_scanner + httpserver.
 
 ## Deploy
 
@@ -431,6 +434,7 @@ mo-sirius-sidecar/
 ├── httpserver/                ← HTTP query server (submodule)
 │   └── src/                   ← Server, serializers
 ├── sirius/                    ← GPU SQL engine (submodule)
+│   ├── substrait/             ← Substrait plan extension (nested submodule)
 │   └── src/
 │       ├── op/scan/           ← tae_scan_task (GPU native TAE reader)
 │       ├── data/              ← host_tae→gpu_table converter (nvCOMP + CUDA)

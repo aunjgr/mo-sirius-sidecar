@@ -13,7 +13,7 @@
     -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/extension_config.cmake"
   ninja -C build/release
   ```
-- GPU sidecar build adds `sirius` on top of the CPU extensions. Build it from inside the Sirius pixi environment so CUDA/cuDF/OpenSSL/lz4 resolve correctly:
+- GPU sidecar build adds `substrait` and `sirius` on top of the CPU extensions. Build it from inside the Sirius pixi environment so CUDA/cuDF/OpenSSL/lz4 resolve correctly:
   ```bash
   git -C sirius submodule update --init cucascade
   cd sirius && pixi install && cd ..
@@ -80,7 +80,7 @@
   - `tae-scanner/`
   - `httpserver/`
   - `sirius/`
-- `extension_config.cmake` is the CPU composition point: it statically links `tae_scanner` and `httpserver` into one DuckDB build. `extension_config_gpu.cmake` includes that CPU config and then adds `sirius`, so the GPU build extends the CPU sidecar instead of defining a separate stack.
+- `extension_config.cmake` is the CPU composition point: it statically links `tae_scanner` and `httpserver` into one DuckDB build. `extension_config_gpu.cmake` includes that CPU config and then adds `substrait` and `sirius`, so the GPU build extends the CPU sidecar instead of defining a separate stack.
 - Runtime query flow spans the docs and submodules:
   1. MatrixOne sees `/*+ SIDECAR */` or `/*+ SIDECAR GPU */`.
   2. MatrixOne rewrites table references to `tae_scan(manifest_url)`.
@@ -95,7 +95,7 @@
 - Treat the root repo as wiring plus documentation. Most behavioral changes belong in the submodules (`tae-scanner/`, `httpserver/`, `sirius/`); root changes usually mean updating `extension_config*.cmake`, build wiring, or integration docs.
 - Preserve the extension layering:
   - CPU sidecar = `tae_scanner` + `httpserver`
-  - GPU sidecar = CPU sidecar + `sirius`
+  - GPU sidecar = CPU sidecar + `substrait` + `sirius`
 - Submodule state matters. Fresh worktrees do not auto-initialize submodules, and Sirius has an extra required nested submodule (`sirius/cucascade`) for GPU builds.
 - `httpserver` behavior is part of the MatrixOne contract here: the sidecar is expected to expose `httpserve_start(...)`, support `X-API-Key` / Basic auth, and return `JSONCompact` responses. Avoid changing response format or auth/header behavior casually.
 - `sirius/` development should target Super Sirius (`gpu_execution`) rather than the legacy `gpu_processing` path. The existing SQLLogicTest flow still reflects the legacy path, which is why `sirius/Makefile` points developers to the C++ unit test binary instead.

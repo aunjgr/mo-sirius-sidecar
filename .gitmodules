@@ -7,7 +7,7 @@
 [submodule "sirius"]
 	path = sirius
 	url = https://github.com/matrixorigin/sirius.git
-	branch = dev
+	branch = tae-scan-support
 [submodule "httpserver"]
 	path = httpserver
 	url = https://github.com/matrixorigin/duckdb-httpserver.git
