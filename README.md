@@ -42,7 +42,7 @@ See [DESIGN.md §13](DESIGN.md#13-gpu-native-tae-scan-sirius) for full architect
 |-----------|--------|-------------|
 | **tae-scanner** | [duckdb-tae-scanner](https://github.com/matrixorigin/duckdb-tae-scanner) | Reads MatrixOne TAE storage objects as DuckDB table functions |
 | **httpserver** | [duckdb-httpserver](https://github.com/matrixorigin/duckdb-httpserver) | DuckDB HTTP server for accepting SQL queries |
-| **substrait** | [duckdb-substrait-extension](https://github.com/matrixorigin/duckdb-substrait-extension) | Imports and exports Substrait query plans (GPU build only) |
+| **substrait** | [duckdb-substrait](https://github.com/matrixorigin/duckdb-substrait) | Imports and exports Substrait query plans (GPU build only) |
 | **sirius** | [sirius](https://github.com/matrixorigin/sirius) | GPU-accelerated SQL execution via cuCascade/cuDF |
 
 Extensions are statically linked into the DuckDB binary — no manual `LOAD` needed.
