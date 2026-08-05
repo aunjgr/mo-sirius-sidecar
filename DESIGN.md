@@ -16,6 +16,15 @@ The sidecar consists of statically-linked DuckDB extensions:
 - **tae_scanner** — reads MatrixOne TAE object files directly via DuckDB table functions
 - **httpserver** — ClickHouse-compatible HTTP interface for receiving queries
 - **sirius** — GPU-accelerated SQL execution via cuCascade/cuDF (GPU build only)
+- **mo_sidecar** — mTLS Arrow Flight, strict Substrait admission, authenticated
+  `TaeRead` resolution, direct Sirius execution, and bounded result streaming
+
+The SQL rewrite/JSON path described below is retained as the prototype and
+benchmark path. The production path does not rewrite or stringify SQL: MO sends
+a bounded logical Substrait plan over Flight, the sidecar resolves opaque
+query-scoped read references over mTLS, and Sirius streams Arrow batches under
+one-batch backpressure. See [`mo-sidecar/README.md`](mo-sidecar/README.md) for
+the production wire and lifecycle contract.
 
 **Key properties:**
 - Zero-copy read path: `pread()` → LZ4 decompress → fill DuckDB vectors
@@ -1924,4 +1933,3 @@ queries go through the CPU path and don't need GPU acceleration.
 The ~0.1ms gRPC latency is negligible compared to GPU execution time (typically
 10ms–10s for analytical queries). The sidecar architecture is strictly superior
 for production use.
-

@@ -17,3 +17,9 @@ duckdb_extension_load(sirius
     LOAD_TESTS
     EXTENSION_VERSION dev
 )
+
+duckdb_extension_load(mo_sidecar
+    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/mo-sidecar
+    LOAD_TESTS
+    EXTENSION_VERSION dev
+)
