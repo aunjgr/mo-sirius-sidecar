@@ -18,8 +18,10 @@
 #     -t mo-sirius:latest -f docker/Dockerfile . && \
 #   rm -rf $tmpdir
 #
-# Run:
+# Run (legacy SQL HTTP only):
 #   docker run --gpus all -p 6001:6001 -p 8888:8888 -p 9999:9999 mo-sirius:latest
+# Mount mTLS credentials and set MO_SIDECAR_FLIGHT_* / MO_SIDECAR_READ_* to
+# enable the production Substrait/Flight endpoint on port 32010.
 #
 # Run TPC-H benchmark inside the container:
 #   docker exec -it <container> tpch-bench 1            # SF=1, all phases
@@ -65,10 +67,10 @@ COPY . .
 
 # Let pixi resolve and install all CUDA/RAPIDS/compiler dependencies,
 # then build the sidecar with the GPU extension config.
-RUN cd sirius && pixi install
+RUN pixi install
 
-RUN cd sirius && pixi run -- bash -c '\
-    cmake -S ../duckdb -B ../build/release-gpu -G Ninja \
+RUN pixi run -- bash -c '\
+    cmake -S duckdb -B build/release-gpu -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DEXTENSION_STATIC_BUILD=1 \
         -DCMAKE_CXX_COMPILER=${CONDA_PREFIX}/bin/clang++ \
@@ -76,8 +78,8 @@ RUN cd sirius && pixi run -- bash -c '\
         -DCMAKE_CXX_COMPILER_LAUNCHER= \
         -DCMAKE_C_COMPILER_LAUNCHER= \
         -DCMAKE_LINKER_TYPE=MOLD \
-        -DDUCKDB_EXTENSION_CONFIGS=$(pwd)/../extension_config_gpu.cmake && \
-    ninja -C ../build/release-gpu'
+        -DDUCKDB_EXTENSION_CONFIGS=$(pwd)/extension_config_gpu.cmake && \
+    ninja -C build/release-gpu'
 
 # Strip sidecar binary and large shared libs.
 RUN strip /sidecar/build/release-gpu/duckdb && \
@@ -85,7 +87,7 @@ RUN strip /sidecar/build/release-gpu/duckdb && \
 
 # Collect only the pixi-provided runtime libraries needed by the sidecar binary.
 COPY docker/collect-runtime-libs.sh /sidecar/collect-runtime-libs.sh
-RUN cd sirius && pixi run -- bash /sidecar/collect-runtime-libs.sh \
+RUN pixi run -- bash /sidecar/collect-runtime-libs.sh \
     /sidecar/build/release-gpu/duckdb /sidecar-runtime-libs
 
 # ---------------------------------------------------------------------------
@@ -156,8 +158,8 @@ RUN mkdir -p /log/tpch && \
     rm -rf /opt/mo-tpch/report /opt/mo-tpch/run.log
 
 # MO ports: 6001 (SQL), 8888 (debug HTTP)
-# Sidecar ports: 9999 (DuckDB HTTP API)
-EXPOSE 6001 8888 9999
+# Sidecar ports: 9999 (legacy DuckDB HTTP API), 32010 (Arrow Flight)
+EXPOSE 6001 8888 9999 32010
 
 COPY docker/entrypoint.sh /entrypoint.sh
 COPY docker/tpch-bench.sh /usr/local/bin/tpch-bench

@@ -7,6 +7,13 @@ queries annotated with `/*+ SIDECAR */` (DuckDB on CPU) or
 `/*+ SIDECAR GPU */` (SiriusDB on GPU) to this sidecar to take advantage of GPU
 for analytic query processing.
 
+The production offload path accepts a strict binary Substrait plan over
+mutually-authenticated Arrow Flight. It resolves opaque, expiring `TaeRead`
+references against MatrixOne over a separate mTLS connection, executes the
+validated logical plan directly through Sirius, and streams Arrow batches with
+one-batch backpressure. The SQL/HTTP path remains available for benchmarks and
+compatibility, but it is not the credential or result-streaming contract.
+
 MatrixOne distinguishes itself from other SiriusDB integrations through its
 fundamental architecture as a Hybrid Transactional/Analytical Processing (HTAP)
 system. This dual-capability framework allows MatrixOne to consistently maintain
@@ -44,6 +51,7 @@ See [DESIGN.md §13](DESIGN.md#13-gpu-native-tae-scan-sirius) for full architect
 | **httpserver** | [duckdb-httpserver](https://github.com/matrixorigin/duckdb-httpserver) | DuckDB HTTP server for accepting SQL queries |
 | **substrait** | [duckdb-substrait](https://github.com/matrixorigin/duckdb-substrait) | Imports and exports Substrait query plans (GPU build only) |
 | **sirius** | [sirius](https://github.com/matrixorigin/sirius) | GPU-accelerated SQL execution via cuCascade/cuDF |
+| **mo-sidecar** | this repository | mTLS Flight server, strict execution envelope, authenticated `TaeRead` resolution, bounded Arrow streaming |
 
 Extensions are statically linked into the DuckDB binary — no manual `LOAD` needed.
 The GPU build adds Substrait and Sirius on top of the base extensions.
@@ -92,9 +100,9 @@ Artifacts:
 
 ### GPU build (requires CUDA)
 
-The Sirius extension uses [pixi](https://pixi.sh) to manage CUDA toolkit,
-cuDF, and other RAPIDS dependencies.  Install pixi first, then initialize
-the Sirius conda environment:
+The composite sidecar uses [pixi](https://pixi.sh) to pin CUDA, RAPIDS, Arrow
+Flight, gRPC, and the compiler toolchain. Install pixi first, then initialize
+the repository environment:
 
 ```bash
 # Install pixi (one-time)
@@ -103,32 +111,32 @@ curl -fsSL https://pixi.sh/install.sh | bash
 # Initialize Sirius submodule deps (cucascade is required at build time)
 git -C sirius submodule update --init cucascade
 
-# Install CUDA + RAPIDS toolchain into sirius/.pixi/
-cd sirius && pixi install && cd ..
+# Install the locked composite toolchain into .pixi/
+pixi install
 ```
 
 Build from within the pixi environment so the compiler can find CUDA, cuDF,
 lz4, and OpenSSL:
 
 ```bash
-SIDECAR_DIR=$(pwd)
-
 # Configure (first time only)
-cd sirius && pixi run -- bash -c "
-  cmake -S $SIDECAR_DIR/duckdb -B $SIDECAR_DIR/build/release-gpu -G Ninja \
+pixi run -- bash -c '
+  cmake -S duckdb -B build/release-gpu -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DDUCKDB_EXTENSION_CONFIGS=$SIDECAR_DIR/extension_config_gpu.cmake
-" && cd ..
+    -DEXTENSION_STATIC_BUILD=1 \
+    -DCMAKE_CXX_COMPILER=${CONDA_PREFIX}/bin/clang++ \
+    -DCMAKE_C_COMPILER=${CONDA_PREFIX}/bin/clang \
+    -DCMAKE_CXX_COMPILER_LAUNCHER= \
+    -DCMAKE_C_COMPILER_LAUNCHER= \
+    -DDUCKDB_EXTENSION_CONFIGS=$(pwd)/extension_config_gpu.cmake'
 
 # Build
-cd sirius && pixi run -- bash -c "
-  ninja -C $SIDECAR_DIR/build/release-gpu
-" && cd ..
+pixi run -- ninja -C build/release-gpu
 ```
 
 > **Note:** The pixi compiler wrapper (conda-forge GCC) does not see system
-> `/usr/include`, so system libraries like lz4 and OpenSSL are declared as
-> pixi dependencies in `sirius/pixi.toml`.
+> `/usr/include`, so native libraries are declared in the root `pixi.toml` and
+> pinned by the root `pixi.lock`.
 
 > **Note:** On machines without an NVIDIA GPU the build succeeds but the
 > binary will print "NVML not available" and refuse GPU queries at runtime.
@@ -163,6 +171,30 @@ DUCKDB_HTTPSERVER_FOREGROUND=1 DUCKDB_HTTPSERVER_PORT=9876 \
 ```
 
 Set `SIRIUS_LOG_LEVEL=debug` for verbose GPU execution logs (very noisy).
+
+### Production Flight endpoint
+
+The Flight endpoint is disabled unless `MO_SIDECAR_FLIGHT_PORT` is set. Once
+enabled, every TLS/read-service setting is required and checked before the port
+is bound:
+
+| Variable | Purpose |
+|---|---|
+| `MO_SIDECAR_FLIGHT_HOST` | Bind host (default `0.0.0.0`) |
+| `MO_SIDECAR_FLIGHT_PORT` | TLS Flight port; setting it enables the endpoint |
+| `MO_SIDECAR_FLIGHT_CERT`, `MO_SIDECAR_FLIGHT_KEY` | Server certificate and private key PEM paths |
+| `MO_SIDECAR_FLIGHT_CLIENT_CA` | CA used to require and verify MatrixOne client certificates |
+| `MO_SIDECAR_READ_URL` | MatrixOne `https://.../internal/v1/sidecar/read/resolve` endpoint |
+| `MO_SIDECAR_READ_CA` | CA used to verify the MatrixOne read service |
+| `MO_SIDECAR_READ_CLIENT_CERT`, `MO_SIDECAR_READ_CLIENT_KEY` | Sidecar workload identity PEM paths |
+| `MO_SIDECAR_MAX_ACTIVE_TICKETS` | Pending + running execution bound (default 128) |
+| `MO_SIDECAR_MAX_BATCH_BYTES` | Per-batch hard bound (default 64 MiB) |
+| `MO_SIDECAR_TICKET_TTL_MS` | Maximum unclaimed/running ticket lifetime (default 30 s) |
+
+The wire schema and server behavior are documented in
+[`mo-sidecar/README.md`](mo-sidecar/README.md). `GetCapabilities` returns the
+canonical capability document; clients hash those exact bytes with SHA-256 and
+include the digest in both the execution envelope and every `TaeRead`.
 
 ### Container image (podman / docker)
 

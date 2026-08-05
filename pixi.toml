@@ -1,0 +1,68 @@
+[workspace]
+channels = ["rapidsai", "conda-forge"]
+name = "mo-sirius-sidecar"
+platforms = ["linux-64", "linux-aarch64"]
+requires-pixi = ">=0.59"
+
+[activation]
+scripts = ["sirius/scripts/pixi_activate.sh"]
+
+[activation.env]
+SCCACHE_BASEDIRS = "$PIXI_PROJECT_ROOT:$CONDA_PREFIX"
+
+[dependencies]
+bc = "*"
+cmake = "4.*"
+cuda-nvcc = "*"
+cuda-nvml-dev = "*"
+cxx-compiler = "*"
+make = "*"
+ninja = "*"
+sccache = "*"
+unzip = "*"
+clang = "21.*"
+wget = "*"
+pre-commit = "*"
+identify = ">=2.6"
+clang-tools = "21.*"
+pkg-config = "*"
+mold = "*"
+lz4-c = ">=1.10.0,<2"
+openssl = ">=3.6.2,<4"
+libarrow = "25.0.*"
+libarrow-flight = "25.0.*"
+
+[feature.dev-libs.dependencies]
+librmm = "*"
+libcurand-dev = "*"
+yaml-cpp = "*"
+libabseil = "*"
+duckdb = "=1.5.2"
+spdlog = "1.8.*"
+sqlite = "3.*"
+
+[feature.cuda13.system-requirements]
+cuda = "13"
+
+[feature.cuda13.dependencies]
+cuda-version = "13.*"
+libcudf = "26.04.*"
+
+[feature.cuda13.activation.env]
+CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
+VCPKG_CUDA_VERSION = "13"
+
+[feature.cuda12.system-requirements]
+cuda = "12"
+
+[feature.cuda12.dependencies]
+cuda-version = "12.*"
+libcudf = "26.04.*"
+
+[feature.cuda12.activation.env]
+CUDAARCHS = "75-real;80-real;86-real;90a-real"
+VCPKG_CUDA_VERSION = "12"
+
+[environments]
+default = ["dev-libs", "cuda13"]
+cuda12 = ["dev-libs", "cuda12"]

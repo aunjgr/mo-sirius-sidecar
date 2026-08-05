@@ -1,0 +1,31 @@
+// Copyright 2026 Matrix Origin
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package matrixone.sidecar.v1;
+
+// FlightDescriptor.cmd for GetFlightInfo/BeginExecution.
+message ExecuteSubstraitRequest {
+  uint32 protocol_version = 1;
+  string substrait_version = 2;
+  bytes capability_hash = 3;
+  uint64 max_batch_bytes = 4;
+  uint64 deadline_unix_ms = 5;
+  bytes plan = 6;
+}
+
+// Authenticated HTTPS request sent to MatrixOne. tae_read is the canonical
+// matrixone.sirius.v1.TaeRead wire value from the retained Substrait plan.
+message ResolveTaeReadRequest {
+  bytes tae_read = 1;
+  bytes requested_schema = 2;
+}
+
+// MatrixOne must echo the signed read and return the lease-bound manifest and
+// canonical Substrait schema. The sidecar verifies all three before scanning.
+message ResolveTaeReadResponse {
+  bytes tae_read = 1;
+  bytes manifest = 2;
+  bytes canonical_schema = 3;
+}
