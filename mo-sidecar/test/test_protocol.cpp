@@ -29,13 +29,18 @@ void bytes(std::string &output, unsigned field, std::string_view value) {
 }
 
 std::string valid_execute_request() {
+	const auto query_id = std::string(16, 'q');
+	const auto plan = std::string("plan");
 	std::string result;
-	integer(result, 1, 1);
+	integer(result, 1, 2);
 	bytes(result, 2, "0.78.0");
 	bytes(result, 3, matrixone::sidecar::capability_hash());
 	integer(result, 4, 1024 * 1024);
 	integer(result, 5, 123456789);
-	bytes(result, 6, "plan");
+	bytes(result, 6, plan);
+	bytes(result, 7, query_id);
+	bytes(result, 8, matrixone::sidecar::execution_idempotency_key(42, query_id, plan));
+	integer(result, 9, 42);
 	return result;
 }
 
@@ -43,21 +48,28 @@ std::string valid_execute_request() {
 
 TEST_CASE("ExecuteSubstrait envelope parses strictly", "[sidecar][protocol]") {
 	const auto parsed = matrixone::sidecar::parse_execute_request(valid_execute_request());
-	REQUIRE(parsed.protocol_version == 1);
+	REQUIRE(parsed.protocol_version == 2);
 	REQUIRE(parsed.substrait_version == "0.78.0");
 	REQUIRE(parsed.capability_hash == matrixone::sidecar::capability_hash());
 	REQUIRE(parsed.max_batch_bytes == 1024 * 1024);
 	REQUIRE(parsed.deadline_unix_ms == 123456789);
 	REQUIRE(parsed.plan == "plan");
+	REQUIRE(parsed.query_id == std::string(16, 'q'));
+	REQUIRE(parsed.idempotency_key == matrixone::sidecar::execution_idempotency_key(42, std::string(16, 'q'), "plan"));
+	REQUIRE(parsed.account_id == 42);
+	REQUIRE(matrixone::sidecar::hex(parsed.idempotency_key) ==
+	        "6acdd6974ba32f76809a1a11b372aa531a06dbe3aeb95e4c3dfb6075ce2de177");
 }
 
-TEST_CASE("ExecuteSubstrait rejects duplicates, unknowns, truncation, and wrong wire types", "[sidecar][protocol]") {
+TEST_CASE("ExecuteSubstrait rejects duplicates, unknowns, truncation, and "
+          "wrong wire types",
+          "[sidecar][protocol]") {
 	auto duplicate = valid_execute_request();
 	integer(duplicate, 1, 1);
 	REQUIRE_THROWS(matrixone::sidecar::parse_execute_request(duplicate));
 
 	auto unknown = valid_execute_request();
-	integer(unknown, 7, 1);
+	integer(unknown, 10, 1);
 	REQUIRE_THROWS(matrixone::sidecar::parse_execute_request(unknown));
 
 	auto truncated = valid_execute_request();
@@ -67,6 +79,27 @@ TEST_CASE("ExecuteSubstrait rejects duplicates, unknowns, truncation, and wrong 
 	std::string wrong_wire;
 	bytes(wrong_wire, 1, "1");
 	REQUIRE_THROWS(matrixone::sidecar::parse_execute_request(wrong_wire));
+}
+
+TEST_CASE("CancelExecution accepts exactly one opaque identity", "[sidecar][protocol]") {
+	std::string by_ticket;
+	bytes(by_ticket, 1, std::string(32, 't'));
+	const auto ticket = matrixone::sidecar::parse_cancel_request(by_ticket);
+	REQUIRE(ticket.ticket == std::string(32, 't'));
+	REQUIRE(ticket.idempotency_key.empty());
+
+	std::string by_idempotency;
+	bytes(by_idempotency, 2, std::string(32, 'i'));
+	const auto idempotency = matrixone::sidecar::parse_cancel_request(by_idempotency);
+	REQUIRE(idempotency.ticket.empty());
+	REQUIRE(idempotency.idempotency_key == std::string(32, 'i'));
+
+	auto both = by_ticket + by_idempotency;
+	REQUIRE_THROWS(matrixone::sidecar::parse_cancel_request(both));
+	std::string short_ticket;
+	bytes(short_ticket, 1, "short");
+	REQUIRE_THROWS(matrixone::sidecar::parse_cancel_request(short_ticket));
+	REQUIRE_THROWS(matrixone::sidecar::parse_cancel_request(std::string {}));
 }
 
 TEST_CASE("ResolveTaeRead response is strict and bounded", "[sidecar][protocol]") {
@@ -131,7 +164,7 @@ TEST_CASE("HTTPS endpoint parsing fails closed", "[sidecar][config]") {
 TEST_CASE("Capability document has a stable SHA-256", "[sidecar][protocol]") {
 	REQUIRE(matrixone::sidecar::capability_hash().size() == 32);
 	REQUIRE(matrixone::sidecar::hex(matrixone::sidecar::capability_hash()) ==
-	        "52a6be3f72a10804fee3840b0ea30d225715ad23a321630f063372ee815bc272");
+	        "d5da9b0dfad4c4282aa04f49376561b8950589d87dcf0d851a8fb90c80607fe1");
 	REQUIRE(matrixone::sidecar::sha256_bytes(matrixone::sidecar::capability_document()) ==
 	        matrixone::sidecar::capability_hash());
 }

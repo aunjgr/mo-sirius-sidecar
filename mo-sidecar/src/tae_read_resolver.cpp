@@ -210,12 +210,16 @@ std::string call_read_service(const runtime_config &config, const std::string &r
 
 } // namespace
 
-matrixone_tae_read_resolver::matrixone_tae_read_resolver(duckdb::Connection &connection, const runtime_config &config)
-    : connection_(connection), config_(config) {
+matrixone_tae_read_resolver::matrixone_tae_read_resolver(duckdb::Connection &connection, const runtime_config &config,
+                                                         std::string query_id, std::uint64_t account_id)
+    : connection_(connection), config_(config), query_id_(std::move(query_id)), account_id_(account_id) {
 }
 
 std::unique_ptr<resolved_tae_read>
 matrixone_tae_read_resolver::resolve(const tae_read &request, const ::substrait::NamedStruct &requested_schema) {
+	if (request.query_id != query_id_ || request.account_id != account_id_) {
+		authentication_failed("TaeRead identity does not match the Flight execution");
+	}
 	if (request.capability_hash != capability_hash()) {
 		authentication_failed("TaeRead capability hash does not match this sidecar");
 	}

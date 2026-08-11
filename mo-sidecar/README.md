@@ -10,7 +10,11 @@ auto-starts when `MO_SIDECAR_FLIGHT_PORT` is configured.
   digest is the capability hash used by all later requests.
 - `GetFlightInfo(FlightDescriptor::CMD)` is `BeginExecution`. The command is a
   strict `matrixone.sidecar.v1.ExecuteSubstraitRequest`; unknown, duplicate,
-  missing, oversized, or wrongly-typed protobuf fields are rejected.
+  missing, oversized, or wrongly-typed protobuf fields are rejected. Its
+  account, 16-byte query ID, plan digest, and 32-byte idempotency key are
+  cryptographically cross-checked. An identical in-flight retry waits for and
+  reuses the original unclaimed ticket; key reuse with different command bytes
+  is rejected.
 - A successful `GetFlightInfo` returns the result schema and one opaque,
   random, single-use 32-byte ticket. Preparation has already completed, so an
   `UNSUPPORTED_PLAN` response is safe for MatrixOne to classify for native
@@ -18,15 +22,17 @@ auto-starts when `MO_SIDECAR_FLIGHT_PORT` is configured.
 - `DoGet(ticket)` claims the ticket once and streams Arrow record batches.
   Sirius's synchronous chunk callback and the Flight reader share a one-batch
   queue; the producer cannot advance until the consumer releases that batch.
-- `DoAction(CancelExecution)` accepts the raw 32-byte ticket. A `quiesced`
-  result is returned only after the execution worker has stopped and released
-  its query-local TAE resolutions. Client stream destruction, explicit
-  cancellation, deadline expiry, server shutdown, and execution failure
-  converge on the same first-terminal-state cleanup.
+- `DoAction(CancelExecution)` accepts a strict `CancelExecutionRequest` with
+  either the 32-byte ticket or the 32-byte preparation idempotency key. The
+  latter closes the lost-`FlightInfo` case where MatrixOne cannot know whether
+  a ticket was created. A `quiesced` result is returned only after the worker
+  has stopped and released its query-local TAE resolutions. Client stream
+  destruction, explicit cancellation, deadline expiry, server shutdown, and
+  execution failure converge on the same first-terminal-state cleanup.
 
 The authoritative protobuf source is
 [`proto/matrixone/sidecar/v1/sidecar.proto`](proto/matrixone/sidecar/v1/sidecar.proto).
-Substrait is pinned to `0.78.0`, the sidecar protocol to v1, and `TaeRead` to
+Substrait is pinned to `0.78.0`, the sidecar protocol to v2, and `TaeRead` to
 v1/features=0.
 
 ## Authenticated TAE resolution
@@ -35,7 +41,8 @@ The retained Substrait plan contains only `matrixone.sirius.v1.TaeRead`; it
 never contains a manifest URL, filesystem path, user token, or object-store
 credential. For each read the resolver:
 
-1. verifies the local capability and requested-schema hashes;
+1. verifies that every signed read has the Flight execution's account and
+   query identity, then verifies the local capability and requested-schema hashes;
 2. sends the canonical `TaeRead` plus requested schema to MatrixOne over mTLS;
 3. requires an exact `TaeRead` echo and verifies the returned manifest and
    canonical-schema SHA-256 digests;

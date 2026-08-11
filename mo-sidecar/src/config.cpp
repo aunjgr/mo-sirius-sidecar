@@ -123,7 +123,8 @@ std::optional<runtime_config> load_runtime_config() {
 	result.max_active_tickets = optional_integer<std::size_t>("MO_SIDECAR_MAX_ACTIVE_TICKETS", 128, 1, 4096);
 	result.max_batch_bytes = optional_integer<std::uint64_t>("MO_SIDECAR_MAX_BATCH_BYTES", 64U * 1024U * 1024U,
 	                                                         64U * 1024U, 1024U * 1024U * 1024U);
-	result.ticket_ttl_ms = optional_integer<std::uint64_t>("MO_SIDECAR_TICKET_TTL_MS", 30'000, 1000, 10U * 60U * 1000U);
+	result.ticket_ttl_ms =
+	    optional_integer<std::uint64_t>("MO_SIDECAR_TICKET_TTL_MS", 15U * 60U * 1000U, 1000, 20U * 60U * 1000U);
 
 	// Fail before binding a port if any credential is absent/unreadable.
 	(void)read_secret_file(result.flight_cert_path);
