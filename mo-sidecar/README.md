@@ -18,9 +18,11 @@ auto-starts when `MO_SIDECAR_FLIGHT_PORT` is configured.
 - `DoGet(ticket)` claims the ticket once and streams Arrow record batches.
   Sirius's synchronous chunk callback and the Flight reader share a one-batch
   queue; the producer cannot advance until the consumer releases that batch.
-- `DoAction(CancelExecution)` accepts the raw 32-byte ticket. Client stream
-  destruction, explicit cancellation, deadline expiry, server shutdown, and
-  execution failure converge on the same first-terminal-state cleanup.
+- `DoAction(CancelExecution)` accepts the raw 32-byte ticket. A `quiesced`
+  result is returned only after the execution worker has stopped and released
+  its query-local TAE resolutions. Client stream destruction, explicit
+  cancellation, deadline expiry, server shutdown, and execution failure
+  converge on the same first-terminal-state cleanup.
 
 The authoritative protobuf source is
 [`proto/matrixone/sidecar/v1/sidecar.proto`](proto/matrixone/sidecar/v1/sidecar.proto).
@@ -42,7 +44,7 @@ credential. For each read the resolver:
 5. drops the view and unlinks the manifest when Sirius releases the move-only
    resolution token.
 
-MatrixOne's read service remains authoritative for query/account/table,
+MatrixOne's read service remains authoritative for query/account/database/table,
 snapshot, lease expiry, schema, and manifest/object-set binding. TLS failures,
 authentication mismatches, malformed responses, and scanner bind failures are
 fail-closed and are never classified as unsupported-plan fallback.

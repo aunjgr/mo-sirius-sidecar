@@ -141,6 +141,7 @@ public:
 
 	~execution_entry() noexcept {
 		cancel(false);
+		std::lock_guard worker_lock(worker_mutex_);
 		if (worker_.joinable()) {
 			if (worker_.get_id() == std::this_thread::get_id()) {
 				worker_.detach();
@@ -213,28 +214,33 @@ public:
 
 	bool cancel(bool timed_out) {
 		bool notify_terminal = false;
+		bool unstarted = false;
 		{
 			std::lock_guard lock(mutex_);
-			if (terminal_) {
+			if (quiesced_) {
 				return false;
 			}
-			terminal_ = true;
-			terminal_status_ = timed_out ? flight_error(flight::FlightStatusCode::TimedOut,
-			                                            "sidecar execution deadline expired", "DEADLINE_EXCEEDED")
-			                             : flight_error(flight::FlightStatusCode::Cancelled,
-			                                            "sidecar execution was cancelled", "CANCELLED");
-			batch_.reset();
-			// A running worker owns the execution until run() exits. Keep it in the
-			// registry so shutdown can still find and join it after cancellation.
-			// An unstarted entry has no worker to perform the terminal callback.
-			if (!worker_.joinable() && !terminal_notified_) {
-				terminal_notified_ = true;
-				notify_terminal = true;
+			if (!terminal_) {
+				terminal_ = true;
+				terminal_status_ = timed_out ? flight_error(flight::FlightStatusCode::TimedOut,
+				                                            "sidecar execution deadline expired", "DEADLINE_EXCEEDED")
+				                             : flight_error(flight::FlightStatusCode::Cancelled,
+				                                            "sidecar execution was cancelled", "CANCELLED");
+				batch_.reset();
 			}
+			unstarted = !worker_.joinable();
 		}
 		execution_->cancel();
 		connection_->Interrupt();
 		(void)evidence_->finish(sirius::execution_outcome::CANCELLED);
+		if (unstarted) {
+			std::lock_guard lock(mutex_);
+			quiesced_ = true;
+			if (!terminal_notified_) {
+				terminal_notified_ = true;
+				notify_terminal = true;
+			}
+		}
 		condition_.notify_all();
 		if (notify_terminal) {
 			on_terminal_(ticket_);
@@ -242,7 +248,22 @@ public:
 		return true;
 	}
 
+	bool cancel_and_join(bool timed_out) {
+		(void)cancel(timed_out);
+		const auto deadline =
+		    std::chrono::system_clock::time_point(std::chrono::milliseconds(request_.deadline_unix_ms));
+		{
+			std::unique_lock lock(mutex_);
+			if (!condition_.wait_until(lock, deadline, [this] { return quiesced_; })) {
+				return false;
+			}
+		}
+		join();
+		return true;
+	}
+
 	void join() noexcept {
+		std::lock_guard worker_lock(worker_mutex_);
 		if (worker_.joinable() && worker_.get_id() != std::this_thread::get_id()) {
 			worker_.join();
 		}
@@ -306,6 +327,7 @@ private:
 				terminal_ = true;
 				terminal_status_ = std::move(status);
 			}
+			quiesced_ = true;
 			if (!terminal_notified_) {
 				terminal_notified_ = true;
 				notify_terminal = true;
@@ -336,7 +358,12 @@ private:
 	arrow::Status terminal_status_ = arrow::Status::OK();
 	bool claimed_ = false;
 	bool terminal_ = false;
+	bool quiesced_ = false;
 	bool terminal_notified_ = false;
+	// Multiple CancelExecution handlers may observe the same entry before the
+	// terminal callback removes it from the registry. std::thread::join is not
+	// safe to call concurrently, so serialize the one successful join.
+	std::mutex worker_mutex_;
 	std::thread worker_;
 };
 
@@ -439,17 +466,19 @@ public:
 		return result->claim() ? result : nullptr;
 	}
 
-	bool cancel(const std::string &ticket) {
+	enum class cancel_result : std::uint8_t { NOT_FOUND = 0, QUIESCED, DEADLINE_EXCEEDED };
+
+	cancel_result cancel_and_join(const std::string &ticket) {
 		std::shared_ptr<execution_entry> entry;
 		{
 			std::lock_guard lock(mutex_);
 			const auto found = entries_.find(ticket);
 			if (found == entries_.end()) {
-				return false;
+				return cancel_result::NOT_FOUND;
 			}
 			entry = found->second;
 		}
-		return entry->cancel(false);
+		return entry->cancel_and_join(false) ? cancel_result::QUIESCED : cancel_result::DEADLINE_EXCEEDED;
 	}
 
 	void shutdown() noexcept {
@@ -624,8 +653,13 @@ public:
 				return arrow::Status::Invalid("CancelExecution body must be a 32-byte ticket");
 			}
 			const std::string ticket(reinterpret_cast<const char *>(action.body->data()), action.body->size());
-			const bool cancelled = registry_.cancel(ticket);
-			results.emplace_back(arrow::Buffer::FromString(cancelled ? "cancelled" : "not-found"));
+			const auto cancelled = registry_.cancel_and_join(ticket);
+			if (cancelled == ticket_registry::cancel_result::DEADLINE_EXCEEDED) {
+				return flight_error(flight::FlightStatusCode::TimedOut,
+				                    "sidecar execution did not quiesce before its deadline", "CANCEL_NOT_QUIESCED");
+			}
+			results.emplace_back(arrow::Buffer::FromString(
+			    cancelled == ticket_registry::cancel_result::QUIESCED ? "quiesced" : "not-found"));
 		} else {
 			return arrow::Status::NotImplemented("unknown sidecar action: ", action.type);
 		}

@@ -5,6 +5,7 @@
 
 #include "mo_sidecar/config.hpp"
 #include "mo_sidecar/protocol.hpp"
+#include "offload/tae_read.hpp"
 
 namespace {
 
@@ -83,6 +84,35 @@ TEST_CASE("ResolveTaeRead response is strict and bounded", "[sidecar][protocol]"
 	REQUIRE_THROWS(matrixone::sidecar::parse_resolve_response(duplicate));
 }
 
+TEST_CASE("TaeRead serialization includes the database identity", "[sidecar][protocol]") {
+	sirius::offload::tae_read request;
+	request.protocol_version = 1;
+	request.read_ref = "read";
+	request.query_id = "query";
+	request.account_id = 7;
+	request.database_id = 11;
+	request.table_id = 13;
+	request.snapshot_ts = std::string(12, 's');
+	request.schema_digest = std::string(32, 'd');
+	request.manifest_sha256 = std::string(32, 'm');
+	request.capability_hash = std::string(32, 'c');
+	request.expires_at_unix_ms = 17;
+
+	std::string expected;
+	integer(expected, 1, 1);
+	bytes(expected, 3, request.read_ref);
+	bytes(expected, 4, request.query_id);
+	integer(expected, 5, request.account_id);
+	integer(expected, 6, request.table_id);
+	bytes(expected, 7, request.snapshot_ts);
+	bytes(expected, 8, request.schema_digest);
+	bytes(expected, 9, request.manifest_sha256);
+	bytes(expected, 10, request.capability_hash);
+	integer(expected, 11, request.expires_at_unix_ms);
+	integer(expected, 12, request.database_id);
+	REQUIRE(matrixone::sidecar::serialize_tae_read(request) == expected);
+}
+
 TEST_CASE("HTTPS endpoint parsing fails closed", "[sidecar][config]") {
 	auto endpoint =
 	    matrixone::sidecar::parse_https_endpoint("https://matrixone.internal:9443/internal/v1/sidecar/read/resolve");
@@ -101,7 +131,7 @@ TEST_CASE("HTTPS endpoint parsing fails closed", "[sidecar][config]") {
 TEST_CASE("Capability document has a stable SHA-256", "[sidecar][protocol]") {
 	REQUIRE(matrixone::sidecar::capability_hash().size() == 32);
 	REQUIRE(matrixone::sidecar::hex(matrixone::sidecar::capability_hash()) ==
-	        "cb9344cfceec3f86095300387d8d60257279ffc368f8e50dc3f202b9d30e53d6");
+	        "52a6be3f72a10804fee3840b0ea30d225715ad23a321630f063372ee815bc272");
 	REQUIRE(matrixone::sidecar::sha256_bytes(matrixone::sidecar::capability_document()) ==
 	        matrixone::sidecar::capability_hash());
 }

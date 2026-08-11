@@ -132,6 +132,9 @@ public:
 	std::uint64_t account_id() const noexcept override {
 		return request_.account_id;
 	}
+	std::uint64_t database_id() const noexcept override {
+		return request_.database_id;
+	}
 	std::uint64_t table_id() const noexcept override {
 		return request_.table_id;
 	}

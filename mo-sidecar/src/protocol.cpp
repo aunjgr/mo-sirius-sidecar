@@ -17,12 +17,18 @@ namespace {
 constexpr std::string_view k_capability_document =
     "{\"protocol_version\":1,\"substrait_version\":\"0.78.0\","
     "\"tae_read_protocol_version\":1,\"tae_read_feature_bits\":0,"
-    "\"operators\":[\"read\",\"filter\",\"project\",\"aggregate\",\"sort\",\"fetch\"],"
+    "\"operators\":[\"read\",\"filter\",\"project\",\"aggregate\",\"sort\","
+    "\"fetch\",\"join\",\"reference\"],"
+    "\"join_types\":[\"inner\",\"left\",\"left_semi\",\"left_anti\"],"
+    "\"expressions\":[\"literal\",\"selection\",\"scalar_function\",\"cast\","
+    "\"if_then\",\"singular_or_list\"],"
     "\"types\":[\"bool\",\"i8\",\"i16\",\"i32\",\"i64\",\"fp32\",\"fp64\","
-    "\"string\",\"date\",\"varchar\",\"precision_timestamp_us\"],"
+    "\"varchar\",\"decimal\",\"date\"],"
+    "\"semantic_registry\":\"exact-mo-bound-overload-and-tpch-family-v1\","
     "\"scalar_functions\":[\"and\",\"or\",\"not\",\"equal\",\"not_equal\",\"lt\","
     "\"lte\",\"gt\",\"gte\",\"is_null\",\"is_not_null\",\"is_not_distinct_from\","
-    "\"add\",\"subtract\",\"multiply\",\"divide\",\"modulus\",\"between\"],"
+    "\"add\",\"subtract\",\"multiply\",\"divide\",\"modulus\",\"between\",\"like\","
+    "\"starts_with\",\"substring\",\"extract\"],"
     "\"aggregate_functions\":[\"count\",\"sum\",\"min\",\"max\",\"avg\"],"
     "\"transport\":\"arrow-flight\",\"sirius_execution_contract\":1,"
     "\"max_plan_bytes\":16777216}";
@@ -206,6 +212,7 @@ std::string serialize_tae_read(const sirius::offload::tae_read &request) {
 	append_bytes(output, 9, request.manifest_sha256);
 	append_bytes(output, 10, request.capability_hash);
 	append_uint(output, 11, request.expires_at_unix_ms);
+	append_uint(output, 12, request.database_id);
 	return output;
 }
 
