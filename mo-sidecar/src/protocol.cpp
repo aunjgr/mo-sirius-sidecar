@@ -19,7 +19,7 @@ constexpr std::string_view k_capability_document =
     "\"tae_read_protocol_version\":1,\"tae_read_feature_bits\":0,"
     "\"operators\":[\"read\",\"filter\",\"project\",\"aggregate\",\"sort\","
     "\"fetch\",\"join\",\"reference\"],"
-    "\"join_types\":[\"inner\",\"left\",\"left_semi\",\"left_anti\","
+    "\"join_types\":[\"inner\",\"left\",\"right\",\"left_semi\",\"left_anti\","
     "\"right_semi\",\"right_anti\"],"
     "\"expressions\":[\"literal\",\"selection\",\"scalar_function\",\"cast\","
     "\"if_then\",\"singular_or_list\"],"

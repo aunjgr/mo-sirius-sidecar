@@ -164,7 +164,7 @@ TEST_CASE("HTTPS endpoint parsing fails closed", "[sidecar][config]") {
 TEST_CASE("Capability document has a stable SHA-256", "[sidecar][protocol]") {
 	REQUIRE(matrixone::sidecar::capability_hash().size() == 32);
 	REQUIRE(matrixone::sidecar::hex(matrixone::sidecar::capability_hash()) ==
-	        "d5da9b0dfad4c4282aa04f49376561b8950589d87dcf0d851a8fb90c80607fe1");
+	        "600b2a4b0c57e37a2b1aac8e99e9d2b064d5e3d9c652419470009080946fb568");
 	REQUIRE(matrixone::sidecar::sha256_bytes(matrixone::sidecar::capability_document()) ==
 	        matrixone::sidecar::capability_hash());
 }
