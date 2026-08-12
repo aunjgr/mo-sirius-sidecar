@@ -189,7 +189,7 @@ is bound:
 | `MO_SIDECAR_READ_CLIENT_CERT`, `MO_SIDECAR_READ_CLIENT_KEY` | Sidecar workload identity PEM paths |
 | `MO_SIDECAR_MAX_ACTIVE_TICKETS` | Pending + running execution bound (default 128) |
 | `MO_SIDECAR_MAX_BATCH_BYTES` | Per-batch hard bound (default 64 MiB) |
-| `MO_SIDECAR_TICKET_TTL_MS` | Maximum unclaimed/running ticket lifetime (default 30 s) |
+| `MO_SIDECAR_TICKET_TTL_MS` | Maximum unclaimed/running ticket lifetime (default 15 min; maximum 20 min) |
 
 The wire schema and server behavior are documented in
 [`mo-sidecar/README.md`](mo-sidecar/README.md). `GetCapabilities` returns the

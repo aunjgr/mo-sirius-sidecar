@@ -5,6 +5,7 @@
 
 #include "mo_sidecar/config.hpp"
 #include "mo_sidecar/protocol.hpp"
+#include "offload/tae_read.hpp"
 
 namespace {
 
@@ -28,13 +29,18 @@ void bytes(std::string &output, unsigned field, std::string_view value) {
 }
 
 std::string valid_execute_request() {
+	const auto query_id = std::string(16, 'q');
+	const auto plan = std::string("plan");
 	std::string result;
-	integer(result, 1, 1);
+	integer(result, 1, 2);
 	bytes(result, 2, "0.78.0");
 	bytes(result, 3, matrixone::sidecar::capability_hash());
 	integer(result, 4, 1024 * 1024);
 	integer(result, 5, 123456789);
-	bytes(result, 6, "plan");
+	bytes(result, 6, plan);
+	bytes(result, 7, query_id);
+	bytes(result, 8, matrixone::sidecar::execution_idempotency_key(42, query_id, plan));
+	integer(result, 9, 42);
 	return result;
 }
 
@@ -42,21 +48,28 @@ std::string valid_execute_request() {
 
 TEST_CASE("ExecuteSubstrait envelope parses strictly", "[sidecar][protocol]") {
 	const auto parsed = matrixone::sidecar::parse_execute_request(valid_execute_request());
-	REQUIRE(parsed.protocol_version == 1);
+	REQUIRE(parsed.protocol_version == 2);
 	REQUIRE(parsed.substrait_version == "0.78.0");
 	REQUIRE(parsed.capability_hash == matrixone::sidecar::capability_hash());
 	REQUIRE(parsed.max_batch_bytes == 1024 * 1024);
 	REQUIRE(parsed.deadline_unix_ms == 123456789);
 	REQUIRE(parsed.plan == "plan");
+	REQUIRE(parsed.query_id == std::string(16, 'q'));
+	REQUIRE(parsed.idempotency_key == matrixone::sidecar::execution_idempotency_key(42, std::string(16, 'q'), "plan"));
+	REQUIRE(parsed.account_id == 42);
+	REQUIRE(matrixone::sidecar::hex(parsed.idempotency_key) ==
+	        "6acdd6974ba32f76809a1a11b372aa531a06dbe3aeb95e4c3dfb6075ce2de177");
 }
 
-TEST_CASE("ExecuteSubstrait rejects duplicates, unknowns, truncation, and wrong wire types", "[sidecar][protocol]") {
+TEST_CASE("ExecuteSubstrait rejects duplicates, unknowns, truncation, and "
+          "wrong wire types",
+          "[sidecar][protocol]") {
 	auto duplicate = valid_execute_request();
 	integer(duplicate, 1, 1);
 	REQUIRE_THROWS(matrixone::sidecar::parse_execute_request(duplicate));
 
 	auto unknown = valid_execute_request();
-	integer(unknown, 7, 1);
+	integer(unknown, 10, 1);
 	REQUIRE_THROWS(matrixone::sidecar::parse_execute_request(unknown));
 
 	auto truncated = valid_execute_request();
@@ -66,6 +79,27 @@ TEST_CASE("ExecuteSubstrait rejects duplicates, unknowns, truncation, and wrong 
 	std::string wrong_wire;
 	bytes(wrong_wire, 1, "1");
 	REQUIRE_THROWS(matrixone::sidecar::parse_execute_request(wrong_wire));
+}
+
+TEST_CASE("CancelExecution accepts exactly one opaque identity", "[sidecar][protocol]") {
+	std::string by_ticket;
+	bytes(by_ticket, 1, std::string(32, 't'));
+	const auto ticket = matrixone::sidecar::parse_cancel_request(by_ticket);
+	REQUIRE(ticket.ticket == std::string(32, 't'));
+	REQUIRE(ticket.idempotency_key.empty());
+
+	std::string by_idempotency;
+	bytes(by_idempotency, 2, std::string(32, 'i'));
+	const auto idempotency = matrixone::sidecar::parse_cancel_request(by_idempotency);
+	REQUIRE(idempotency.ticket.empty());
+	REQUIRE(idempotency.idempotency_key == std::string(32, 'i'));
+
+	auto both = by_ticket + by_idempotency;
+	REQUIRE_THROWS(matrixone::sidecar::parse_cancel_request(both));
+	std::string short_ticket;
+	bytes(short_ticket, 1, "short");
+	REQUIRE_THROWS(matrixone::sidecar::parse_cancel_request(short_ticket));
+	REQUIRE_THROWS(matrixone::sidecar::parse_cancel_request(std::string {}));
 }
 
 TEST_CASE("ResolveTaeRead response is strict and bounded", "[sidecar][protocol]") {
@@ -81,6 +115,35 @@ TEST_CASE("ResolveTaeRead response is strict and bounded", "[sidecar][protocol]"
 	auto duplicate = wire;
 	bytes(duplicate, 2, "again");
 	REQUIRE_THROWS(matrixone::sidecar::parse_resolve_response(duplicate));
+}
+
+TEST_CASE("TaeRead serialization includes the database identity", "[sidecar][protocol]") {
+	sirius::offload::tae_read request;
+	request.protocol_version = 1;
+	request.read_ref = "read";
+	request.query_id = "query";
+	request.account_id = 7;
+	request.database_id = 11;
+	request.table_id = 13;
+	request.snapshot_ts = std::string(12, 's');
+	request.schema_digest = std::string(32, 'd');
+	request.manifest_sha256 = std::string(32, 'm');
+	request.capability_hash = std::string(32, 'c');
+	request.expires_at_unix_ms = 17;
+
+	std::string expected;
+	integer(expected, 1, 1);
+	bytes(expected, 3, request.read_ref);
+	bytes(expected, 4, request.query_id);
+	integer(expected, 5, request.account_id);
+	integer(expected, 6, request.table_id);
+	bytes(expected, 7, request.snapshot_ts);
+	bytes(expected, 8, request.schema_digest);
+	bytes(expected, 9, request.manifest_sha256);
+	bytes(expected, 10, request.capability_hash);
+	integer(expected, 11, request.expires_at_unix_ms);
+	integer(expected, 12, request.database_id);
+	REQUIRE(matrixone::sidecar::serialize_tae_read(request) == expected);
 }
 
 TEST_CASE("HTTPS endpoint parsing fails closed", "[sidecar][config]") {
@@ -101,7 +164,7 @@ TEST_CASE("HTTPS endpoint parsing fails closed", "[sidecar][config]") {
 TEST_CASE("Capability document has a stable SHA-256", "[sidecar][protocol]") {
 	REQUIRE(matrixone::sidecar::capability_hash().size() == 32);
 	REQUIRE(matrixone::sidecar::hex(matrixone::sidecar::capability_hash()) ==
-	        "cb9344cfceec3f86095300387d8d60257279ffc368f8e50dc3f202b9d30e53d6");
+	        "600b2a4b0c57e37a2b1aac8e99e9d2b064d5e3d9c652419470009080946fb568");
 	REQUIRE(matrixone::sidecar::sha256_bytes(matrixone::sidecar::capability_document()) ==
 	        matrixone::sidecar::capability_hash());
 }

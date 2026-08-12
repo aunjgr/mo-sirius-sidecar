@@ -12,7 +12,8 @@ namespace matrixone::sidecar {
 
 class matrixone_tae_read_resolver final : public sirius::offload::tae_read_resolver {
 public:
-	matrixone_tae_read_resolver(duckdb::Connection &connection, const runtime_config &config);
+	matrixone_tae_read_resolver(duckdb::Connection &connection, const runtime_config &config, std::string query_id,
+	                            std::uint64_t account_id);
 
 	std::unique_ptr<sirius::offload::resolved_tae_read>
 	resolve(const sirius::offload::tae_read &request, const ::substrait::NamedStruct &requested_schema) override;
@@ -20,6 +21,8 @@ public:
 private:
 	duckdb::Connection &connection_;
 	const runtime_config &config_;
+	std::string query_id_;
+	std::uint64_t account_id_;
 };
 
 } // namespace matrixone::sidecar

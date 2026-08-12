@@ -15,14 +15,24 @@ namespace matrixone::sidecar {
 namespace {
 
 constexpr std::string_view k_capability_document =
-    "{\"protocol_version\":1,\"substrait_version\":\"0.78.0\","
+    "{\"protocol_version\":2,\"substrait_version\":\"0.78.0\","
     "\"tae_read_protocol_version\":1,\"tae_read_feature_bits\":0,"
-    "\"operators\":[\"read\",\"filter\",\"project\",\"aggregate\",\"sort\",\"fetch\"],"
+    "\"operators\":[\"read\",\"filter\",\"project\",\"aggregate\",\"sort\","
+    "\"fetch\",\"join\",\"reference\"],"
+    "\"join_types\":[\"inner\",\"left\",\"right\",\"left_semi\",\"left_anti\","
+    "\"right_semi\",\"right_anti\"],"
+    "\"expressions\":[\"literal\",\"selection\",\"scalar_function\",\"cast\","
+    "\"if_then\",\"singular_or_list\"],"
     "\"types\":[\"bool\",\"i8\",\"i16\",\"i32\",\"i64\",\"fp32\",\"fp64\","
-    "\"string\",\"date\",\"varchar\",\"precision_timestamp_us\"],"
-    "\"scalar_functions\":[\"and\",\"or\",\"not\",\"equal\",\"not_equal\",\"lt\","
-    "\"lte\",\"gt\",\"gte\",\"is_null\",\"is_not_null\",\"is_not_distinct_from\","
-    "\"add\",\"subtract\",\"multiply\",\"divide\",\"modulus\",\"between\"],"
+    "\"varchar\",\"decimal\",\"date\"],"
+    "\"semantic_registry\":\"exact-mo-bound-overload-and-tpch-family-v1\","
+    "\"scalar_functions\":[\"and\",\"or\",\"not\",\"equal\",\"not_equal\","
+    "\"lt\","
+    "\"lte\",\"gt\",\"gte\",\"is_null\",\"is_not_null\",\"is_not_distinct_"
+    "from\","
+    "\"add\",\"subtract\",\"multiply\",\"divide\",\"modulus\",\"between\","
+    "\"like\","
+    "\"starts_with\",\"substring\",\"extract\"],"
     "\"aggregate_functions\":[\"count\",\"sum\",\"min\",\"max\",\"avg\"],"
     "\"transport\":\"arrow-flight\",\"sirius_execution_contract\":1,"
     "\"max_plan_bytes\":16777216}";
@@ -117,10 +127,10 @@ execute_request parse_execute_request(std::string_view bytes) {
 	std::uint64_t seen = 0;
 	while (!reader.done()) {
 		const auto tag = reader.varint();
-		expect_field(tag, 6, seen);
+		expect_field(tag, 9, seen);
 		const auto field = static_cast<unsigned>(tag >> 3U);
 		const auto wire = static_cast<unsigned>(tag & 7U);
-		const bool integer = field == 1 || field == 4 || field == 5;
+		const bool integer = field == 1 || field == 4 || field == 5 || field == 9;
 		if (wire != (integer ? 0U : 2U)) {
 			throw std::invalid_argument("wrong protobuf wire type");
 		}
@@ -148,12 +158,53 @@ execute_request parse_execute_request(std::string_view bytes) {
 		case 6:
 			result.plan = reader.bytes(k_max_plan_bytes);
 			break;
+		case 7:
+			result.query_id = reader.bytes(16U);
+			break;
+		case 8:
+			result.idempotency_key = reader.bytes(k_sha256_bytes);
+			break;
+		case 9:
+			result.account_id = reader.varint();
+			break;
 		default:
 			throw std::invalid_argument("unknown ExecuteSubstrait field");
 		}
 	}
-	if (seen != 0x3fU) {
+	if (seen != 0x1ffU || result.query_id.size() != 16U || result.idempotency_key.size() != k_sha256_bytes ||
+	    result.account_id == 0) {
 		throw std::invalid_argument("ExecuteSubstrait request is missing a field");
+	}
+	return result;
+}
+
+cancel_request parse_cancel_request(std::string_view bytes) {
+	if (bytes.empty() || bytes.size() > k_sha256_bytes + 2U) {
+		throw std::invalid_argument("CancelExecution request is empty or too large");
+	}
+	wire_reader reader(bytes);
+	cancel_request result;
+	std::uint64_t seen = 0;
+	while (!reader.done()) {
+		const auto tag = reader.varint();
+		expect_field(tag, 2, seen);
+		if ((tag & 7U) != 2U) {
+			throw std::invalid_argument("wrong CancelExecution wire type");
+		}
+		switch (tag >> 3U) {
+		case 1:
+			result.ticket = reader.bytes(k_sha256_bytes);
+			break;
+		case 2:
+			result.idempotency_key = reader.bytes(k_sha256_bytes);
+			break;
+		default:
+			throw std::invalid_argument("unknown CancelExecution field");
+		}
+	}
+	if ((seen != 0x1U && seen != 0x2U) || (!result.ticket.empty() && result.ticket.size() != k_sha256_bytes) ||
+	    (!result.idempotency_key.empty() && result.idempotency_key.size() != k_sha256_bytes)) {
+		throw std::invalid_argument("CancelExecution requires exactly one 32-byte identity");
 	}
 	return result;
 }
@@ -206,6 +257,7 @@ std::string serialize_tae_read(const sirius::offload::tae_read &request) {
 	append_bytes(output, 9, request.manifest_sha256);
 	append_bytes(output, 10, request.capability_hash);
 	append_uint(output, 11, request.expires_at_unix_ms);
+	append_uint(output, 12, request.database_id);
 	return output;
 }
 
@@ -247,6 +299,19 @@ std::string hex(std::string_view bytes) {
 		result[i * 2 + 1] = digits[value & 0xfU];
 	}
 	return result;
+}
+
+std::string execution_idempotency_key(std::uint64_t account_id, std::string_view query_id, std::string_view plan) {
+	if (account_id == 0 || query_id.size() != 16U || plan.empty()) {
+		throw std::invalid_argument("invalid execution identity");
+	}
+	std::string input(8, '\0');
+	for (unsigned i = 0; i < 8; ++i) {
+		input[i] = static_cast<char>((account_id >> (i * 8U)) & 0xffU);
+	}
+	input.append(query_id);
+	input.append(sha256_bytes(plan));
+	return sha256_bytes(input);
 }
 
 std::string_view capability_document() {

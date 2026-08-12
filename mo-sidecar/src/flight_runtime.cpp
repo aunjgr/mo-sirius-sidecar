@@ -134,13 +134,14 @@ public:
 	    : config_(config), request_(std::move(request)), ticket_(std::move(ticket)),
 	      on_terminal_(std::move(on_terminal)), connection_(std::make_unique<duckdb::Connection>(database)),
 	      evidence_(std::make_shared<sirius::execution_evidence>(sirius::execution_backend::SIRIUS_GPU)) {
-		matrixone_tae_read_resolver resolver(*connection_, config_);
+		matrixone_tae_read_resolver resolver(*connection_, config_, request_.query_id, request_.account_id);
 		execution_ = sirius::offload::prepare_substrait(*connection_->context, request_.plan, resolver, evidence_);
 		schema_ = make_arrow_schema(*connection_->context, execution_->schema());
 	}
 
 	~execution_entry() noexcept {
 		cancel(false);
+		std::lock_guard worker_lock(worker_mutex_);
 		if (worker_.joinable()) {
 			if (worker_.get_id() == std::this_thread::get_id()) {
 				worker_.detach();
@@ -158,6 +159,13 @@ public:
 	}
 	std::uint64_t deadline_unix_ms() const noexcept {
 		return request_.deadline_unix_ms;
+	}
+	const std::string &idempotency_key() const noexcept {
+		return request_.idempotency_key;
+	}
+	bool replayable() {
+		std::lock_guard lock(mutex_);
+		return !claimed_ && !terminal_;
 	}
 
 	bool claim() {
@@ -213,28 +221,33 @@ public:
 
 	bool cancel(bool timed_out) {
 		bool notify_terminal = false;
+		bool unstarted = false;
 		{
 			std::lock_guard lock(mutex_);
-			if (terminal_) {
+			if (quiesced_) {
 				return false;
 			}
-			terminal_ = true;
-			terminal_status_ = timed_out ? flight_error(flight::FlightStatusCode::TimedOut,
-			                                            "sidecar execution deadline expired", "DEADLINE_EXCEEDED")
-			                             : flight_error(flight::FlightStatusCode::Cancelled,
-			                                            "sidecar execution was cancelled", "CANCELLED");
-			batch_.reset();
-			// A running worker owns the execution until run() exits. Keep it in the
-			// registry so shutdown can still find and join it after cancellation.
-			// An unstarted entry has no worker to perform the terminal callback.
-			if (!worker_.joinable() && !terminal_notified_) {
-				terminal_notified_ = true;
-				notify_terminal = true;
+			if (!terminal_) {
+				terminal_ = true;
+				terminal_status_ = timed_out ? flight_error(flight::FlightStatusCode::TimedOut,
+				                                            "sidecar execution deadline expired", "DEADLINE_EXCEEDED")
+				                             : flight_error(flight::FlightStatusCode::Cancelled,
+				                                            "sidecar execution was cancelled", "CANCELLED");
+				batch_.reset();
 			}
+			unstarted = !worker_.joinable();
 		}
 		execution_->cancel();
 		connection_->Interrupt();
 		(void)evidence_->finish(sirius::execution_outcome::CANCELLED);
+		if (unstarted) {
+			std::lock_guard lock(mutex_);
+			quiesced_ = true;
+			if (!terminal_notified_) {
+				terminal_notified_ = true;
+				notify_terminal = true;
+			}
+		}
 		condition_.notify_all();
 		if (notify_terminal) {
 			on_terminal_(ticket_);
@@ -242,7 +255,32 @@ public:
 		return true;
 	}
 
+	bool cancel_and_join(bool timed_out, const std::function<bool()> &stop_waiting = {}) {
+		(void)cancel(timed_out);
+		const auto deadline =
+		    std::chrono::system_clock::time_point(std::chrono::milliseconds(request_.deadline_unix_ms));
+		{
+			std::unique_lock lock(mutex_);
+			while (!quiesced_) {
+				lock.unlock();
+				const bool stopped = stop_waiting && stop_waiting();
+				lock.lock();
+				if (stopped) {
+					return false;
+				}
+				const auto now = std::chrono::system_clock::now();
+				if (now >= deadline) {
+					return false;
+				}
+				condition_.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(100)));
+			}
+		}
+		join();
+		return true;
+	}
+
 	void join() noexcept {
+		std::lock_guard worker_lock(worker_mutex_);
 		if (worker_.joinable() && worker_.get_id() != std::this_thread::get_id()) {
 			worker_.join();
 		}
@@ -306,6 +344,7 @@ private:
 				terminal_ = true;
 				terminal_status_ = std::move(status);
 			}
+			quiesced_ = true;
 			if (!terminal_notified_) {
 				terminal_notified_ = true;
 				notify_terminal = true;
@@ -336,7 +375,12 @@ private:
 	arrow::Status terminal_status_ = arrow::Status::OK();
 	bool claimed_ = false;
 	bool terminal_ = false;
+	bool quiesced_ = false;
 	bool terminal_notified_ = false;
+	// Multiple CancelExecution handlers may observe the same entry before the
+	// terminal callback removes it from the registry. std::thread::join is not
+	// safe to call concurrently, so serialize the one successful join.
+	std::mutex worker_mutex_;
 	std::thread worker_;
 };
 
@@ -381,19 +425,65 @@ public:
 	}
 
 	arrow::Result<std::shared_ptr<execution_entry>> prepare(execute_request request) {
+		std::shared_ptr<execution_entry> existing;
 		{
-			std::lock_guard lock(mutex_);
-			if (stopped_) {
-				return flight_error(flight::FlightStatusCode::Unavailable, "sidecar is stopping");
+			std::unique_lock lock(mutex_);
+			while (true) {
+				if (stopped_) {
+					return flight_error(flight::FlightStatusCode::Unavailable, "sidecar is stopping");
+				}
+				const auto idempotency = idempotency_.find(request.idempotency_key);
+				if (idempotency == idempotency_.end()) {
+					if (entries_.size() + reserved_ >= config_.max_active_tickets) {
+						return flight_error(flight::FlightStatusCode::Unavailable,
+						                    "sidecar active ticket limit reached", "RESOURCE_EXHAUSTED");
+					}
+					++reserved_;
+					idempotency_.emplace(request.idempotency_key,
+					                     idempotency_record {.fingerprint = request.fingerprint,
+					                                         .ticket = {},
+					                                         .deadline_unix_ms = request.deadline_unix_ms,
+					                                         .preparing = true});
+					break;
+				}
+				if (idempotency->second.fingerprint != request.fingerprint) {
+					return flight_error(flight::FlightStatusCode::Failed,
+					                    "idempotency key was reused for a different request", "IDEMPOTENCY_CONFLICT");
+				}
+				if (idempotency->second.preparing) {
+					const auto deadline = std::chrono::system_clock::time_point(
+					    std::chrono::milliseconds(idempotency->second.deadline_unix_ms));
+					if (state_changed_.wait_until(lock, deadline) == std::cv_status::timeout) {
+						return flight_error(flight::FlightStatusCode::TimedOut,
+						                    "idempotent request did not finish preparing "
+						                    "before its deadline",
+						                    "IDEMPOTENCY_IN_PROGRESS");
+					}
+					continue;
+				}
+				if (idempotency->second.cancel_requested) {
+					return flight_error(flight::FlightStatusCode::Failed, "idempotent request is already terminal",
+					                    "IDEMPOTENCY_TERMINAL");
+				}
+				const auto found = entries_.find(idempotency->second.ticket);
+				if (found == entries_.end()) {
+					return flight_error(flight::FlightStatusCode::Internal,
+					                    "idempotent request lost its prepared ticket", "IDEMPOTENCY_STATE_INVALID");
+				}
+				existing = found->second;
+				break;
 			}
-			if (entries_.size() + reserved_ >= config_.max_active_tickets) {
-				return flight_error(flight::FlightStatusCode::Unavailable, "sidecar active ticket limit reached",
-				                    "RESOURCE_EXHAUSTED");
+		}
+		if (existing) {
+			if (!existing->replayable()) {
+				return flight_error(flight::FlightStatusCode::Failed, "idempotent request ticket was already claimed",
+				                    "IDEMPOTENCY_ALREADY_CLAIMED");
 			}
-			++reserved_;
+			return existing;
 		}
 
 		std::shared_ptr<execution_entry> entry;
+		const auto idempotency_key = request.idempotency_key;
 		try {
 			std::string ticket;
 			do {
@@ -403,25 +493,37 @@ public:
 			    database_, config_, std::move(request), ticket,
 			    [this](const std::string &completed_ticket) { remove(completed_ticket); });
 		} catch (...) {
-			release_reservation();
+			release_reservation(idempotency_key);
 			throw;
 		}
 
 		bool stopping = false;
+		bool cancel_requested = false;
 		{
 			std::lock_guard lock(mutex_);
 			--reserved_;
 			if (stopped_) {
 				stopping = true;
+				idempotency_.erase(idempotency_key);
 			} else {
 				entries_.emplace(entry->ticket(), entry);
+				auto &idempotency = idempotency_.at(idempotency_key);
+				idempotency.ticket = entry->ticket();
+				idempotency.preparing = false;
+				cancel_requested = idempotency.cancel_requested;
 			}
 		}
+		state_changed_.notify_all();
 		// cancel() calls the registry's terminal callback, so it must never run
 		// while mutex_ is held.
 		if (stopping) {
 			entry->cancel(false);
 			return flight_error(flight::FlightStatusCode::Unavailable, "sidecar is stopping");
+		}
+		if (cancel_requested) {
+			(void)entry->cancel_and_join(false);
+			return flight_error(flight::FlightStatusCode::Cancelled, "idempotent request was cancelled while preparing",
+			                    "CANCELLED");
 		}
 		return entry;
 	}
@@ -439,17 +541,59 @@ public:
 		return result->claim() ? result : nullptr;
 	}
 
-	bool cancel(const std::string &ticket) {
+	enum class cancel_result : std::uint8_t { NOT_FOUND = 0, QUIESCED, DEADLINE_EXCEEDED };
+
+	cancel_result cancel_and_join(const std::string &ticket, const std::function<bool()> &stop_waiting = {}) {
 		std::shared_ptr<execution_entry> entry;
 		{
 			std::lock_guard lock(mutex_);
 			const auto found = entries_.find(ticket);
 			if (found == entries_.end()) {
-				return false;
+				return cancel_result::NOT_FOUND;
 			}
 			entry = found->second;
 		}
-		return entry->cancel(false);
+		return entry->cancel_and_join(false, stop_waiting) ? cancel_result::QUIESCED : cancel_result::DEADLINE_EXCEEDED;
+	}
+
+	cancel_result cancel_and_join_idempotency(const std::string &idempotency_key,
+	                                          const std::function<bool()> &stop_waiting = {}) {
+		std::shared_ptr<execution_entry> entry;
+		{
+			std::unique_lock lock(mutex_);
+			while (true) {
+				if (stopped_) {
+					return cancel_result::NOT_FOUND;
+				}
+				const auto found = idempotency_.find(idempotency_key);
+				if (found == idempotency_.end()) {
+					return cancel_result::NOT_FOUND;
+				}
+				found->second.cancel_requested = true;
+				if (!found->second.preparing) {
+					const auto ticket = entries_.find(found->second.ticket);
+					if (ticket == entries_.end()) {
+						return cancel_result::NOT_FOUND;
+					}
+					entry = ticket->second;
+					break;
+				}
+				const auto deadline =
+				    std::chrono::system_clock::time_point(std::chrono::milliseconds(found->second.deadline_unix_ms));
+				lock.unlock();
+				const bool stopped_waiting = stop_waiting && stop_waiting();
+				lock.lock();
+				if (stopped_waiting) {
+					return cancel_result::DEADLINE_EXCEEDED;
+				}
+				const auto now = std::chrono::system_clock::now();
+				if (now >= deadline) {
+					return cancel_result::DEADLINE_EXCEEDED;
+				}
+				state_changed_.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(100)));
+			}
+		}
+		return entry->cancel_and_join(false, stop_waiting) ? cancel_result::QUIESCED : cancel_result::DEADLINE_EXCEEDED;
 	}
 
 	void shutdown() noexcept {
@@ -465,6 +609,7 @@ public:
 			}
 		}
 		wake_.notify_all();
+		state_changed_.notify_all();
 		if (reaper_.joinable()) {
 			reaper_.join();
 		}
@@ -476,6 +621,8 @@ public:
 		}
 		std::lock_guard lock(mutex_);
 		entries_.clear();
+		idempotency_.clear();
+		state_changed_.notify_all();
 	}
 
 private:
@@ -484,14 +631,21 @@ private:
 		return entries_.contains(ticket);
 	}
 
-	void release_reservation() {
+	void release_reservation(const std::string &idempotency_key) {
 		std::lock_guard lock(mutex_);
 		--reserved_;
+		idempotency_.erase(idempotency_key);
+		state_changed_.notify_all();
 	}
 
 	void remove(const std::string &ticket) {
 		std::lock_guard lock(mutex_);
-		entries_.erase(ticket);
+		const auto found = entries_.find(ticket);
+		if (found != entries_.end()) {
+			idempotency_.erase(found->second->idempotency_key());
+			entries_.erase(found);
+		}
+		state_changed_.notify_all();
 	}
 
 	void reap() noexcept {
@@ -520,7 +674,16 @@ private:
 	const runtime_config &config_;
 	std::mutex mutex_;
 	std::condition_variable wake_;
+	std::condition_variable state_changed_;
 	std::unordered_map<std::string, std::shared_ptr<execution_entry>> entries_;
+	struct idempotency_record {
+		std::string fingerprint;
+		std::string ticket;
+		std::uint64_t deadline_unix_ms = 0;
+		bool preparing = false;
+		bool cancel_requested = false;
+	};
+	std::unordered_map<std::string, idempotency_record> idempotency_;
 	std::size_t reserved_ = 0;
 	bool stopped_ = false;
 	std::thread reaper_;
@@ -543,6 +706,13 @@ public:
 		}
 		try {
 			auto request = parse_execute_request(descriptor.cmd);
+			if (request.idempotency_key !=
+			    execution_idempotency_key(request.account_id, request.query_id, request.plan)) {
+				return flight_error(flight::FlightStatusCode::Unauthorized,
+				                    "ExecuteSubstrait idempotency key does not match its identity",
+				                    "AUTHENTICATION_FAILED");
+			}
+			request.fingerprint = sha256_bytes(descriptor.cmd);
 			const auto now = now_unix_ms();
 			if (request.protocol_version != k_protocol_version || request.substrait_version != k_substrait_version) {
 				return flight_error(flight::FlightStatusCode::Failed,
@@ -607,11 +777,11 @@ public:
 
 	arrow::Status ListActions(const flight::ServerCallContext &, std::vector<flight::ActionType> *actions) override {
 		actions->emplace_back("GetCapabilities", "Return the canonical sidecar capability document");
-		actions->emplace_back("CancelExecution", "Cancel an opaque Flight ticket");
+		actions->emplace_back("CancelExecution", "Cancel by opaque Flight ticket or request idempotency key");
 		return arrow::Status::OK();
 	}
 
-	arrow::Status DoAction(const flight::ServerCallContext &, const flight::Action &action,
+	arrow::Status DoAction(const flight::ServerCallContext &context, const flight::Action &action,
 	                       std::unique_ptr<flight::ResultStream> *result) override {
 		std::vector<flight::Result> results;
 		if (action.type == "GetCapabilities") {
@@ -620,12 +790,26 @@ public:
 			}
 			results.emplace_back(arrow::Buffer::FromString(std::string(capability_document())));
 		} else if (action.type == "CancelExecution") {
-			if (!action.body || action.body->size() != 32) {
-				return arrow::Status::Invalid("CancelExecution body must be a 32-byte ticket");
+			if (!action.body) {
+				return arrow::Status::Invalid("CancelExecution body is required");
 			}
-			const std::string ticket(reinterpret_cast<const char *>(action.body->data()), action.body->size());
-			const bool cancelled = registry_.cancel(ticket);
-			results.emplace_back(arrow::Buffer::FromString(cancelled ? "cancelled" : "not-found"));
+			cancel_request request;
+			try {
+				request = parse_cancel_request(
+				    std::string_view(reinterpret_cast<const char *>(action.body->data()), action.body->size()));
+			} catch (const std::invalid_argument &error) {
+				return arrow::Status::Invalid(error.what());
+			}
+			const auto stop_waiting = [&context] { return context.is_cancelled(); };
+			const auto cancelled = request.ticket.empty()
+			                           ? registry_.cancel_and_join_idempotency(request.idempotency_key, stop_waiting)
+			                           : registry_.cancel_and_join(request.ticket, stop_waiting);
+			if (cancelled == ticket_registry::cancel_result::DEADLINE_EXCEEDED) {
+				return flight_error(flight::FlightStatusCode::TimedOut,
+				                    "sidecar execution did not quiesce before its deadline", "CANCEL_NOT_QUIESCED");
+			}
+			results.emplace_back(arrow::Buffer::FromString(
+			    cancelled == ticket_registry::cancel_result::QUIESCED ? "quiesced" : "not-found"));
 		} else {
 			return arrow::Status::NotImplemented("unknown sidecar action: ", action.type);
 		}

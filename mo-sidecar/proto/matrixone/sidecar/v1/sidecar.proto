@@ -13,6 +13,15 @@ message ExecuteSubstraitRequest {
   uint64 max_batch_bytes = 4;
   uint64 deadline_unix_ms = 5;
   bytes plan = 6;
+  bytes query_id = 7;
+  bytes idempotency_key = 8;
+  uint64 account_id = 9;
+}
+
+// Flight Action.body for CancelExecution. Exactly one identity is required.
+message CancelExecutionRequest {
+  bytes ticket = 1;
+  bytes idempotency_key = 2;
 }
 
 // Authenticated HTTPS request sent to MatrixOne. tae_read is the canonical
