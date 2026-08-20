@@ -14,7 +14,8 @@ struct tae_read;
 
 namespace matrixone::sidecar {
 
-inline constexpr std::uint32_t k_protocol_version = 2;
+inline constexpr std::uint32_t k_protocol_version = 3;
+inline constexpr std::uint32_t k_tae_read_protocol_version = 2;
 inline constexpr std::string_view k_substrait_version = "0.78.0";
 inline constexpr std::size_t k_sha256_bytes = 32;
 inline constexpr std::size_t k_max_plan_bytes = 16U * 1024U * 1024U;
@@ -52,7 +53,7 @@ std::string serialize_tae_read(const sirius::offload::tae_read &request);
 std::array<unsigned char, k_sha256_bytes> sha256(std::string_view bytes);
 std::string sha256_bytes(std::string_view bytes);
 std::string hex(std::string_view bytes);
-std::string execution_idempotency_key(std::uint64_t account_id, std::string_view query_id, std::string_view plan);
+std::string execution_idempotency_key(std::uint64_t account_id, std::string_view query_id);
 
 std::string_view capability_document();
 const std::string &capability_hash();

@@ -15,8 +15,8 @@ namespace matrixone::sidecar {
 namespace {
 
 constexpr std::string_view k_capability_document =
-    "{\"protocol_version\":2,\"substrait_version\":\"0.78.0\","
-    "\"tae_read_protocol_version\":1,\"tae_read_feature_bits\":0,"
+    "{\"protocol_version\":3,\"substrait_version\":\"0.78.0\","
+    "\"tae_read_protocol_version\":2,\"tae_read_feature_bits\":0,"
     "\"operators\":[\"read\",\"filter\",\"project\",\"aggregate\",\"sort\","
     "\"fetch\",\"join\",\"reference\"],"
     "\"join_types\":[\"inner\",\"left\",\"right\",\"left_semi\",\"left_anti\","
@@ -91,6 +91,11 @@ void append_uint(std::string &output, unsigned field, std::uint64_t value) {
 	if (value == 0) {
 		return;
 	}
+	append_varint(output, static_cast<std::uint64_t>(field) << 3U);
+	append_varint(output, value);
+}
+
+void append_required_uint(std::string &output, unsigned field, std::uint64_t value) {
 	append_varint(output, static_cast<std::uint64_t>(field) << 3U);
 	append_varint(output, value);
 }
@@ -171,8 +176,7 @@ execute_request parse_execute_request(std::string_view bytes) {
 			throw std::invalid_argument("unknown ExecuteSubstrait field");
 		}
 	}
-	if (seen != 0x1ffU || result.query_id.size() != 16U || result.idempotency_key.size() != k_sha256_bytes ||
-	    result.account_id == 0) {
+	if (seen != 0x1ffU || result.query_id.size() != 16U || result.idempotency_key.size() != k_sha256_bytes) {
 		throw std::invalid_argument("ExecuteSubstrait request is missing a field");
 	}
 	return result;
@@ -250,7 +254,7 @@ std::string serialize_tae_read(const sirius::offload::tae_read &request) {
 	append_uint(output, 2, request.feature_bits);
 	append_bytes(output, 3, request.read_ref);
 	append_bytes(output, 4, request.query_id);
-	append_uint(output, 5, request.account_id);
+	append_required_uint(output, 5, request.account_id);
 	append_uint(output, 6, request.table_id);
 	append_bytes(output, 7, request.snapshot_ts);
 	append_bytes(output, 8, request.schema_digest);
@@ -301,8 +305,8 @@ std::string hex(std::string_view bytes) {
 	return result;
 }
 
-std::string execution_idempotency_key(std::uint64_t account_id, std::string_view query_id, std::string_view plan) {
-	if (account_id == 0 || query_id.size() != 16U || plan.empty()) {
+std::string execution_idempotency_key(std::uint64_t account_id, std::string_view query_id) {
+	if (query_id.size() != 16U) {
 		throw std::invalid_argument("invalid execution identity");
 	}
 	std::string input(8, '\0');
@@ -310,7 +314,6 @@ std::string execution_idempotency_key(std::uint64_t account_id, std::string_view
 		input[i] = static_cast<char>((account_id >> (i * 8U)) & 0xffU);
 	}
 	input.append(query_id);
-	input.append(sha256_bytes(plan));
 	return sha256_bytes(input);
 }
 

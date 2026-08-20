@@ -13,6 +13,8 @@
 #include <arrow/c/bridge.h>
 #include <arrow/flight/api.h>
 #include <arrow/flight/server.h>
+#include <arrow/ipc/writer.h>
+#include <arrow/memory_pool.h>
 #include <arrow/record_batch.h>
 #include <duckdb/common/arrow/arrow_converter.hpp>
 #include <duckdb/main/connection.hpp>
@@ -23,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -134,6 +137,10 @@ public:
 	    : config_(config), request_(std::move(request)), ticket_(std::move(ticket)),
 	      on_terminal_(std::move(on_terminal)), connection_(std::make_unique<duckdb::Connection>(database)),
 	      evidence_(std::make_shared<sirius::execution_evidence>(sirius::execution_backend::SIRIUS_GPU)) {
+		// Resolution creates query-local views that binding and execution must
+		// observe in one transaction. The entry owns the connection through
+		// quiescence; Connection rolls this read-only transaction back on destroy.
+		connection_->BeginTransaction();
 		matrixone_tae_read_resolver resolver(*connection_, config_, request_.query_id, request_.account_id);
 		execution_ = sirius::offload::prepare_substrait(*connection_->context, request_.plan, resolver, evidence_);
 		schema_ = make_arrow_schema(*connection_->context, execution_->schema());
@@ -706,8 +713,7 @@ public:
 		}
 		try {
 			auto request = parse_execute_request(descriptor.cmd);
-			if (request.idempotency_key !=
-			    execution_idempotency_key(request.account_id, request.query_id, request.plan)) {
+			if (request.idempotency_key != execution_idempotency_key(request.account_id, request.query_id)) {
 				return flight_error(flight::FlightStatusCode::Unauthorized,
 				                    "ExecuteSubstrait idempotency key does not match its identity",
 				                    "AUTHENTICATION_FAILED");
@@ -746,13 +752,19 @@ public:
 			std::vector<flight::FlightEndpoint> endpoints;
 			endpoints.emplace_back(flight::Ticket(entry->ticket()), std::vector<flight::Location> {}, std::nullopt,
 			                       std::string {});
-			auto result =
-			    flight::FlightInfo::Make(entry->schema(), descriptor, endpoints, -1, -1, false, capability_hash());
-			if (!result.ok()) {
+			auto serialized_schema = arrow::ipc::SerializeSchema(*entry->schema(), arrow::system_memory_pool());
+			if (!serialized_schema.ok()) {
 				entry->cancel(false);
-				return result.status();
+				return serialized_schema.status();
 			}
-			*info = std::make_unique<flight::FlightInfo>(std::move(result).ValueOrDie());
+			flight::FlightInfo::Data data {std::move(serialized_schema).ValueOrDie()->ToString(),
+			                               descriptor,
+			                               std::move(endpoints),
+			                               -1,
+			                               -1,
+			                               false,
+			                               capability_hash()};
+			*info = std::make_unique<flight::FlightInfo>(std::move(data));
 			return arrow::Status::OK();
 		} catch (const sirius::offload::substrait_execution_error &error) {
 			return substrait_error(error);
@@ -845,6 +857,12 @@ flight_runtime::~flight_runtime() noexcept {
 }
 
 void flight_runtime::start() {
+	// Arrow's conda jemalloc backend conflicts with DuckDB/Sirius allocator
+	// ownership in this process. Install the process-wide Arrow backend before
+	// any Flight worker can initialize the default pool.
+	if (::setenv("ARROW_DEFAULT_MEMORY_POOL", "system", 1) != 0) {
+		throw std::runtime_error("cannot configure Arrow system memory pool");
+	}
 	auto location = flight::Location::ForGrpcTls(impl_->config.flight_host, impl_->config.flight_port);
 	if (!location.ok()) {
 		throw std::runtime_error(location.status().ToString());
