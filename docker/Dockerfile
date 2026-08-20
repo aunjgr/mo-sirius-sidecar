@@ -9,6 +9,7 @@
 # Build:
 #   ./docker/build.sh                         # uses ../mo-tpch by default
 #   MO_TPCH_DIR=/path/to/mo-tpch ./docker/build.sh
+#   MO_REF=<matrixone-commit-or-branch> ./docker/build.sh
 #
 # The script runs `git archive` against MO_TPCH_DIR to feed mo-tpch source
 # into the build via a named build context. Raw `podman build` works too:
@@ -20,8 +21,8 @@
 #
 # Run (legacy SQL HTTP only):
 #   docker run --gpus all -p 6001:6001 -p 8888:8888 -p 9999:9999 mo-sirius:latest
-# Mount mTLS credentials and set MO_SIDECAR_FLIGHT_* / MO_SIDECAR_READ_* to
-# enable the production Substrait/Flight endpoint on port 32010.
+# Set MO_SIRIUS_FLIGHT=1 and mount the mTLS credentials to enable the local-CN
+# Substrait/Flight benchmark profile. See README.md for the exact contract.
 #
 # Run TPC-H benchmark inside the container:
 #   docker exec -it <container> tpch-bench 1            # SF=1, all phases
@@ -30,9 +31,12 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Build MO (CPU only)
 # ---------------------------------------------------------------------------
-FROM golang:trixie AS mo-builder
+# Keep this in sync with MatrixOne's go.mod. An unversioned golang:trixie
+# image can move to an incompatible experimental Go toolchain.
+FROM golang:1.26.4-trixie AS mo-builder
 
 ARG GOPROXY="https://proxy.golang.org,direct"
+ENV TAR_OPTIONS=--no-same-owner
 RUN go env -w GOPROXY=${GOPROXY}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -43,15 +47,18 @@ ARG MO_REPO=https://github.com/matrixorigin/matrixone.git
 ARG MO_BRANCH=main
 ARG MO_REF=
 
-RUN git clone -b ${MO_BRANCH} ${MO_REPO} /mo && \
-    if [ -n "${MO_REF}" ]; then git -C /mo checkout ${MO_REF}; fi
+RUN git clone --branch "$MO_BRANCH" "$MO_REPO" /mo && \
+    if [ -n "$MO_REF" ]; then git -C /mo checkout --detach "$MO_REF"; fi
 WORKDIR /mo
 RUN go mod download && make clean && make build && strip mo-service
+RUN git rev-parse HEAD > /mo-build-ref
 
 # ---------------------------------------------------------------------------
 # Stage 2: Build sidecar (GPU via pixi)
 # ---------------------------------------------------------------------------
 FROM debian:trixie AS sidecar-builder
+
+ARG SIRIUS_REF=unknown
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -89,6 +96,7 @@ RUN strip /sidecar/build/release-gpu/duckdb && \
 COPY docker/collect-runtime-libs.sh /sidecar/collect-runtime-libs.sh
 RUN pixi run -- bash /sidecar/collect-runtime-libs.sh \
     /sidecar/build/release-gpu/duckdb /sidecar-runtime-libs
+RUN printf '%s\n' "${SIRIUS_REF}" > /sidecar/sirius-build-ref
 
 # ---------------------------------------------------------------------------
 # Stage 3: Build mo-tpch dbgen
@@ -133,11 +141,16 @@ COPY docker/etc/launch.toml /etc/launch/launch.toml
 COPY docker/etc/cn.toml     /etc/launch/cn.toml
 COPY docker/etc/tn.toml     /etc/launch/tn.toml
 COPY docker/etc/log.toml    /etc/launch/log.toml
+COPY docker/etc/launch-flight.toml /etc/launch/launch-flight.toml
+COPY docker/etc/cn-flight.toml     /etc/launch/cn-flight.toml
+COPY docker/etc/tn-flight.toml     /etc/launch/tn-flight.toml
 
 # Sidecar binary + pixi runtime libs + Sirius config
 COPY --from=sidecar-builder /sidecar/build/release-gpu/duckdb /sidecar/duckdb
 COPY --from=sidecar-builder /sidecar-runtime-libs/ /usr/local/lib/
 COPY sirius.yaml.example /etc/sidecar/sirius.yaml
+COPY --from=mo-builder /mo-build-ref /etc/sidecar/matrixone-ref
+COPY --from=sidecar-builder /sidecar/sirius-build-ref /etc/sidecar/sirius-ref
 
 # mo-tpch (dbgen, queries, schema, golden answers, run.sh)
 COPY --from=mo-tpch-builder /mo-tpch /opt/mo-tpch

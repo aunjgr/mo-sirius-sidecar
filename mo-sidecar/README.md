@@ -4,6 +4,24 @@ The `mo_sidecar` DuckDB extension is the production MatrixOne-to-Sirius
 control and result plane. It is linked only by `extension_config_gpu.cmake` and
 auto-starts when `MO_SIDECAR_FLIGHT_PORT` is configured.
 
+## Deployment scope
+
+The supported deployment is one local sidecar owned by one MatrixOne CN. The
+sidecar's Flight listener and read-resolver connection are independent mTLS
+directions, and the resolver client certificate is the identity that the CN
+authorizes for each opaque read lease. Do not share a sidecar or its resolver
+identity across CNs.
+
+For the bundled image, set `MO_SIRIUS_FLIGHT=1` and mount the certificate
+directory at `/etc/sirius-certs:ro`. The entrypoint selects the paired
+one-CN launcher, binds Flight only on the container's loopback interface, sets
+the exact `MO_SIDECAR_FLIGHT_*` and `MO_SIDECAR_READ_*` values, and refuses to
+start if a credential is missing. See the repository [container
+instructions](../README.md#container-image-podman--docker) for certificate
+roles and the TPC-H command sequence. This benchmark profile deliberately
+uses non-durable local leases with TN GC disabled; it is not a multi-CN or
+restart-recovery deployment.
+
 ## RPC contract
 
 - `DoAction(GetCapabilities)` returns a canonical JSON document. Its SHA-256
