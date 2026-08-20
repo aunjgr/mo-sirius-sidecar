@@ -121,7 +121,7 @@ FROM debian:trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgomp1 curl tini bc python3 mariadb-client-core && \
+        libgomp1 curl tini bc python3 mariadb-client-core openssl && \
     ln -sf /usr/bin/python3 /usr/local/bin/python && \
     rm -rf /var/lib/apt/lists/*
 
@@ -149,6 +149,7 @@ COPY docker/etc/tn-flight.toml     /etc/launch/tn-flight.toml
 COPY --from=sidecar-builder /sidecar/build/release-gpu/duckdb /sidecar/duckdb
 COPY --from=sidecar-builder /sidecar-runtime-libs/ /usr/local/lib/
 COPY sirius.yaml.example /etc/sidecar/sirius.yaml
+COPY sirius.dev-tls.yaml /etc/sidecar/sirius-dev-tls.yaml
 COPY --from=mo-builder /mo-build-ref /etc/sidecar/matrixone-ref
 COPY --from=sidecar-builder /sidecar/sirius-build-ref /etc/sidecar/sirius-ref
 
@@ -175,7 +176,8 @@ RUN mkdir -p /log/tpch && \
 EXPOSE 6001 8888 9999 32010
 
 COPY docker/entrypoint.sh /entrypoint.sh
+COPY docker/generate-dev-tls.sh /usr/local/bin/generate-dev-tls.sh
 COPY docker/tpch-bench.sh /usr/local/bin/tpch-bench
-RUN chmod +x /entrypoint.sh /usr/local/bin/tpch-bench
+RUN chmod +x /entrypoint.sh /usr/local/bin/generate-dev-tls.sh /usr/local/bin/tpch-bench
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

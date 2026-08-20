@@ -22,6 +22,12 @@ roles and the TPC-H command sequence. This benchmark profile deliberately
 uses non-durable local leases with TN GC disabled; it is not a multi-CN or
 restart-recovery deployment.
 
+For a same-container development benchmark only,
+`MO_SIRIUS_FLIGHT_DEV_TLS=1` generates fresh, short-lived credentials before
+either service starts. This avoids shipping a shared private identity while
+letting a public image run without a certificate mount. It must not be used for
+a separate sidecar, remote CN, production workload, or restart-recovery test.
+
 ## RPC contract
 
 - `DoAction(GetCapabilities)` returns a canonical JSON document. Its SHA-256
