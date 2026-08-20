@@ -238,6 +238,20 @@ builder is pinned to the Go version declared in that source tree, and the
 Dockerfile tolerates archive ownership metadata so the same command works with
 rootless Podman as well as Docker.
 
+Choose the image profile before starting it:
+
+| Profile | Select it with | MatrixOne transport | Host ports | Intended use |
+|---|---|---|---|---|
+| Legacy HTTP | default | rewritten SQL over `http://127.0.0.1:9999` | `6001`, `8888`, optionally `9999` | compatibility and side-by-side benchmarks |
+| Flight/Substrait | `MO_SIRIUS_FLIGHT=1` | logical Substrait plan and Arrow batches over local mTLS Flight | `6001`, `8888`; never publish Flight | one local CN and its paired GPU sidecar |
+
+The two profiles are mutually exclusive. The Flight profile does not use
+`cn.frontend.sidecarUrl`, does not accept a remote sidecar, and must not be
+combined with individually overridden `MO_SIDECAR_FLIGHT_*` or
+`MO_SIDECAR_READ_*` values.
+
+#### Legacy HTTP profile
+
 A typical run with all bind-mounts (data, TPC-H scratch, logs, sirius
 config) — daemonized so we can drive it later via `podman exec`:
 
@@ -268,7 +282,7 @@ What each mount is for:
   `DATA_DIR` env to override.
 - **`/log`** — see "Container logs" below.
 
-#### Flight/Substrait benchmark profile
+#### Flight/Substrait local-CN benchmark profile
 
 The image defaults to the legacy HTTP profile above. To start one local CN and
 its paired GPU sidecar with the authenticated Flight path, opt in explicitly:
@@ -304,6 +318,23 @@ non-durable, local lease adapter and disables GC in its paired TN. It is for a
 one-CN benchmark only: do not use it for production traffic, restart recovery,
 or multiple CNs.
 
+Confirm the running image was built from the MatrixOne and Sirius revisions you
+expect, then run the GPU TPC-H path through Flight:
+
+```bash
+podman exec mo-sirius-flight sh -c \
+  'printf "MatrixOne: "; cat /etc/sidecar/matrixone-ref; \
+   printf "Sirius: "; cat /etc/sidecar/sirius-ref'
+
+# Complete SF1 run. The Flight profile turns ENGINE=gpu into explicit
+# MatrixOne Substrait/Flight offload rather than legacy HTTP forwarding.
+podman exec mo-sirius-flight bash -lc 'ENGINE=gpu tpch-bench 1'
+
+# Reuse an already loaded SF10 data set and run queries only.
+podman exec mo-sirius-flight bash -lc \
+  'ENGINE=gpu GEN=0 CTAB=0 LOAD=0 tpch-bench 10'
+```
+
 **Running TPC-H benchmarks.** The image bundles
 [`mo-tpch`](https://github.com/matrixorigin/mo-tpch) at `/opt/mo-tpch`
 with a pre-built `dbgen`, the schema (`mo.ddl`), all 22 queries, and
@@ -334,8 +365,8 @@ The Flight schema represents MatrixOne `CHAR(n)` as `VARCHAR(n)` without
 trimming or padding; MatrixOne converts the result back to the original output
 type.
 
-To drive the bench from the host against the daemonized container above,
-use `podman exec`:
+To drive a legacy HTTP benchmark from the host against the daemonized legacy
+container above, use `podman exec`:
 
 ```bash
 podman exec mo-sirius bash -lc 'ENGINE=gpu tpch-bench 10'
@@ -347,6 +378,10 @@ podman exec mo-sirius bash -lc 'ENGINE=gpu GEN=0 CTAB=0 LOAD=0 tpch-bench 10'
 podman exec -d mo-sirius bash -lc 'ENGINE=gpu tpch-bench 10'
 tail -f log/tpch/*/run.log
 ```
+
+Use the `mo-sirius-flight` commands above for Flight; the two container names
+are deliberately different so a legacy HTTP benchmark cannot be confused with
+an authenticated Substrait run.
 
 **Container logs.** MO and the sidecar run at debug level by default
 and would otherwise flood the host's syslog through the journald log
@@ -386,7 +421,9 @@ bypass them entirely:
 - **Tune knobs via environment variables** (see table below) — all
   `SIRIUS_*`, `DUCKDB_HTTPSERVER_*`, `MO_DEBUG_HTTP`, and
   `MO_LAUNCH_CONF` are passed through. `MO_SIRIUS_FLIGHT=1` owns the
-  Flight endpoint variables and requires its bundled launch profile:
+  Flight endpoint variables and requires its bundled launch profile. Do not
+  override `MO_LAUNCH_CONF` in that mode unless the replacement preserves the
+  same one-CN, loopback-only, mTLS configuration:
 
   ```bash
   podman run --device nvidia.com/gpu=all ... \
