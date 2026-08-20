@@ -238,6 +238,23 @@ builder is pinned to the Go version declared in that source tree, and the
 Dockerfile tolerates archive ownership metadata so the same command works with
 rootless Podman as well as Docker.
 
+#### Pulling the published image
+
+The validated Flight image is published as the immutable tag
+`ghcr.io/aunjgr/mo-sirius:flight-dd712e795f-db05a6c`. At publication time the
+GHCR package is private, so another user must first be granted package access
+and authenticate with a token that has `read:packages`:
+
+```bash
+podman login ghcr.io
+podman pull ghcr.io/aunjgr/mo-sirius:flight-dd712e795f-db05a6c
+```
+
+Docker users use `docker login ghcr.io` and `docker pull` with the same tag.
+The tag records MatrixOne `dd712e795f7734b90400941a8be396525ab32274` and
+Sirius `fc5e6765db019f72ba2228276ebb9503fd4f061e`; verify the files in
+`/etc/sidecar/` after starting a container if you need to audit provenance.
+
 Choose the image profile before starting it:
 
 | Profile | Select it with | MatrixOne transport | Host ports | Intended use |
@@ -249,6 +266,14 @@ The two profiles are mutually exclusive. The Flight profile does not use
 `cn.frontend.sidecarUrl`, does not accept a remote sidecar, and must not be
 combined with individually overridden `MO_SIDECAR_FLIGHT_*` or
 `MO_SIDECAR_READ_*` values.
+
+The legacy profile can start without an mTLS bundle. The Flight profile cannot
+and should not: the image deliberately contains no CA, certificate, or private
+key. Its entrypoint exits before starting either service unless the twelve
+directional mTLS files listed below are mounted. A user therefore needs three
+things before the Flight profile is runnable: access to this GHCR package, an
+NVIDIA GPU exposed to the container runtime, and a certificate bundle issued
+for that local CN/sidecar pair.
 
 #### Legacy HTTP profile
 
