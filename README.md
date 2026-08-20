@@ -369,6 +369,12 @@ mount, a separately started sidecar, a remote CN, or any production or
 restart-recovery workflow. Use the mounted certificate profile above whenever
 the mTLS identity must outlive the container.
 
+This development mode also selects `/etc/sidecar/sirius-dev-tls.yaml` unless
+you explicitly set `SIRIUS_CONFIG_FILE`. It intentionally limits Sirius to 50%
+of available VRAM, 2 GiB of host capacity per NUMA node, and 128 MiB scan/hash
+batches so a typical development GPU can start alongside its display and other
+processes. It is a safe startup profile, not a performance profile.
+
 Confirm the running image was built from the MatrixOne and Sirius revisions you
 expect, then run the GPU TPC-H path through Flight:
 

@@ -1,0 +1,37 @@
+# Conservative settings for MO_SIRIUS_FLIGHT_DEV_TLS=1. The normal
+# sirius.yaml remains the performance-oriented profile; this avoids reserving
+# nearly all VRAM before a one-container developer benchmark can start.
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.5
+      reservation_limit_fraction: 0.8
+      downgrade_trigger_fraction: 0.8
+      downgrade_stop_fraction: 0.6
+    host:
+      capacity_bytes: 2Gi
+      reservation_limit_fraction: 0.8
+      downgrade_trigger_fraction: 0.8
+      downgrade_stop_fraction: 0.6
+      block_size: 1Mi
+      pool_size: 64
+      initial_number_pools: 1
+  executor:
+    pipeline:
+      num_threads: 2
+    duckdb_scan:
+      num_threads: 2
+    task_creator:
+      num_threads: 1
+    downgrade:
+      num_threads: 2
+      monitor_period_ms: 10
+  operator_params:
+    scan_task_batch_size: 128Mi
+    default_scan_task_varchar_size: 256
+    max_sort_partition_bytes: 0
+    hash_partition_bytes: 128Mi
+    concat_batch_bytes: 128Mi
+    max_build_hash_table_bytes: 128Mi

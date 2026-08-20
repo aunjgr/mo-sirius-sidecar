@@ -19,6 +19,7 @@ if [ "${MO_SIRIUS_FLIGHT}" = "1" ]; then
     MO_LAUNCH_CONF="${MO_LAUNCH_CONF:-/etc/launch/launch-flight.toml}"
     cert_dir=/etc/sirius-certs
     if [ "${MO_SIRIUS_FLIGHT_DEV_TLS}" = "1" ]; then
+        SIRIUS_CONFIG_FILE="${SIRIUS_CONFIG_FILE:-/etc/sidecar/sirius-dev-tls.yaml}"
         dev_marker="${cert_dir}/.dev-tls-generated"
         if [ -f "${dev_marker}" ] && [ "$(cat "${dev_marker}")" = "mo-sirius-sidecar-dev-tls-v1" ]; then
             if openssl x509 -checkend 60 -noout -in "${cert_dir}/sidecar-flight-server.crt" >/dev/null 2>&1; then
@@ -148,6 +149,26 @@ done
 if ! curl -sf --noproxy '*' "${SIDECAR_URL}/ping" >/dev/null 2>&1; then
     echo "[entrypoint] ERROR: Sidecar did not become ready within 30 seconds."
     exit 1
+fi
+
+if [ "${MO_SIRIUS_FLIGHT}" = "1" ]; then
+    echo "[entrypoint] Waiting for local Flight service ..."
+    FLIGHT_READY=0
+    for i in $(seq 1 30); do
+        if (exec 8<>/dev/tcp/127.0.0.1/32010; exec 8>&-) >/dev/null 2>&1; then
+            FLIGHT_READY=1
+            break
+        fi
+        if ! kill -0 "$SIDECAR_PID" 2>/dev/null; then
+            echo "[entrypoint] ERROR: Sidecar exited before Flight became ready."
+            exit 1
+        fi
+        sleep 1
+    done
+    if [ "${FLIGHT_READY}" -ne 1 ]; then
+        echo "[entrypoint] ERROR: Flight did not become ready within 30 seconds."
+        exit 1
+    fi
 fi
 
 # --- Start MO ---

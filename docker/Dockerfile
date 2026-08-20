@@ -149,6 +149,7 @@ COPY docker/etc/tn-flight.toml     /etc/launch/tn-flight.toml
 COPY --from=sidecar-builder /sidecar/build/release-gpu/duckdb /sidecar/duckdb
 COPY --from=sidecar-builder /sidecar-runtime-libs/ /usr/local/lib/
 COPY sirius.yaml.example /etc/sidecar/sirius.yaml
+COPY sirius.dev-tls.yaml /etc/sidecar/sirius-dev-tls.yaml
 COPY --from=mo-builder /mo-build-ref /etc/sidecar/matrixone-ref
 COPY --from=sidecar-builder /sidecar/sirius-build-ref /etc/sidecar/sirius-ref
 
