@@ -241,18 +241,16 @@ rootless Podman as well as Docker.
 #### Pulling the published image
 
 The validated Flight image is published as the immutable tag
-`ghcr.io/aunjgr/mo-sirius:flight-dd712e795f-db05a6c`. At publication time the
-GHCR package is private, so another user must first be granted package access
-and authenticate with a token that has `read:packages`:
+`ghcr.io/aunjgr/mo-sirius:flight-dd712e795f-db05a6c`. The GHCR package is
+public, so anyone can pull it without a registry login:
 
 ```bash
-podman login ghcr.io
 podman pull ghcr.io/aunjgr/mo-sirius:flight-dd712e795f-db05a6c
 ```
 
-Docker users use `docker login ghcr.io` and `docker pull` with the same tag.
-The tag records MatrixOne `dd712e795f7734b90400941a8be396525ab32274` and
-Sirius `fc5e6765db019f72ba2228276ebb9503fd4f061e`; verify the files in
+Docker users use `docker pull` with the same tag. The tag records MatrixOne
+`dd712e795f7734b90400941a8be396525ab32274` and Sirius
+`fc5e6765db019f72ba2228276ebb9503fd4f061e`; verify the files in
 `/etc/sidecar/` after starting a container if you need to audit provenance.
 
 Choose the image profile before starting it:
@@ -271,9 +269,9 @@ The legacy profile can start without an mTLS bundle. The Flight profile cannot
 and should not: the image deliberately contains no CA, certificate, or private
 key. Its entrypoint exits before starting either service unless the twelve
 directional mTLS files listed below are mounted. A user therefore needs three
-things before the Flight profile is runnable: access to this GHCR package, an
-NVIDIA GPU exposed to the container runtime, and a certificate bundle issued
-for that local CN/sidecar pair.
+things before the regular Flight profile is runnable: an NVIDIA GPU exposed to
+the container runtime, a certificate bundle issued for that local CN/sidecar
+pair, and the local MatrixOne data volume.
 
 #### Legacy HTTP profile
 
@@ -342,6 +340,34 @@ certificate must identify `localhost`. The profile intentionally enables the
 non-durable, local lease adapter and disables GC in its paired TN. It is for a
 one-CN benchmark only: do not use it for production traffic, restart recovery,
 or multiple CNs.
+
+#### Zero-config development TLS
+
+For a fresh, same-container benchmark, the `flight-dev-tls-v1` image release
+adds `MO_SIRIUS_FLIGHT_DEV_TLS=1`. It creates fresh, one-day, directional mTLS
+roots and leaf certificates inside a new container before it starts either the
+sidecar or MatrixOne. Nothing is baked into the image and nothing needs to be
+mounted at `/etc/sirius-certs`:
+
+```bash
+podman pull ghcr.io/aunjgr/mo-sirius:flight-dev-tls-v1
+mkdir -p $(pwd)/{mo-data,tpch-data,log}
+podman run -d --name mo-sirius-flight-dev --device nvidia.com/gpu=all \
+  -p 6001:6001 -p 8888:8888 \
+  -e MO_SIRIUS_FLIGHT=1 \
+  -e MO_SIRIUS_FLIGHT_DEV_TLS=1 \
+  -v $(pwd)/mo-data:/mo-data \
+  -v $(pwd)/tpch-data:/opt/mo-tpch/data \
+  -v $(pwd)/log:/log \
+  ghcr.io/aunjgr/mo-sirius:flight-dev-tls-v1
+```
+
+The generated identities are deliberately ephemeral and local to this one
+container. A container restart reuses its still-valid credentials and rotates
+them when they are close to expiry. Do not use this mode with a certificate
+mount, a separately started sidecar, a remote CN, or any production or
+restart-recovery workflow. Use the mounted certificate profile above whenever
+the mTLS identity must outlive the container.
 
 Confirm the running image was built from the MatrixOne and Sirius revisions you
 expect, then run the GPU TPC-H path through Flight:
@@ -468,7 +494,8 @@ bypass them entirely:
 | `DUCKDB_HTTPSERVER_FOREGROUND` | `0` | Set to `1` to block after startup (daemon mode) |
 | `SIRIUS_LOG_LEVEL` | `warn` | Sirius GPU engine log level (`info`, `debug`, `trace`) |
 | `SIRIUS_TAE_BASELINE_COLS` | `4` | GPU TAE scan: projected-col count at which `scan_task_batch_size` is used as-is. Effective cap scales as `scan_task_batch_size × baseline / proj_cols` (floored at 32MB); wider projections get smaller per-task batches to reduce GPU tail latency. `0` disables scaling. |
-| `MO_SIRIUS_FLIGHT` | `0` | Set to `1` to select the bundled local-CN Substrait/Flight benchmark profile and require `/etc/sirius-certs` |
+| `MO_SIRIUS_FLIGHT` | `0` | Set to `1` to select the bundled local-CN Substrait/Flight benchmark profile; requires `/etc/sirius-certs` unless development TLS is enabled |
+| `MO_SIRIUS_FLIGHT_DEV_TLS` | `0` | With `MO_SIRIUS_FLIGHT=1`, generate fresh in-container development mTLS credentials; never use with a cert mount or outside the one-container benchmark |
 | `MO_LAUNCH_CONF` | `/etc/launch/launch.toml` | MO launch manifest; defaults to `launch-flight.toml` when `MO_SIRIUS_FLIGHT=1` |
 
 ### Manual start (interactive)

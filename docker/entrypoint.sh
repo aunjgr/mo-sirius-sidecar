@@ -3,9 +3,48 @@ set -euo pipefail
 
 MO_DEBUG_HTTP="${MO_DEBUG_HTTP:-:8888}"
 MO_SIRIUS_FLIGHT="${MO_SIRIUS_FLIGHT:-0}"
+MO_SIRIUS_FLIGHT_DEV_TLS="${MO_SIRIUS_FLIGHT_DEV_TLS:-0}"
+case "${MO_SIRIUS_FLIGHT_DEV_TLS}" in
+    0|1) ;;
+    *)
+        echo "[entrypoint] ERROR: MO_SIRIUS_FLIGHT_DEV_TLS must be 0 or 1." >&2
+        exit 2
+        ;;
+esac
+if [ "${MO_SIRIUS_FLIGHT}" != "1" ] && [ "${MO_SIRIUS_FLIGHT_DEV_TLS}" = "1" ]; then
+    echo "[entrypoint] ERROR: MO_SIRIUS_FLIGHT_DEV_TLS requires MO_SIRIUS_FLIGHT=1." >&2
+    exit 2
+fi
 if [ "${MO_SIRIUS_FLIGHT}" = "1" ]; then
     MO_LAUNCH_CONF="${MO_LAUNCH_CONF:-/etc/launch/launch-flight.toml}"
     cert_dir=/etc/sirius-certs
+    if [ "${MO_SIRIUS_FLIGHT_DEV_TLS}" = "1" ]; then
+        dev_marker="${cert_dir}/.dev-tls-generated"
+        if [ -f "${dev_marker}" ] && [ "$(cat "${dev_marker}")" = "mo-sirius-sidecar-dev-tls-v1" ]; then
+            if openssl x509 -checkend 60 -noout -in "${cert_dir}/sidecar-flight-server.crt" >/dev/null 2>&1; then
+                echo "[entrypoint] Reusing local development TLS credentials."
+            else
+                rm -f "${cert_dir}/.dev-tls-generated" \
+                    "${cert_dir}/sidecar-flight-ca.crt" \
+                    "${cert_dir}/mo-flight-client-ca.crt" \
+                    "${cert_dir}/mo-flight-client.crt" "${cert_dir}/mo-flight-client.key" \
+                    "${cert_dir}/mo-resolver-server-ca.crt" \
+                    "${cert_dir}/sidecar-read-client-ca.crt" \
+                    "${cert_dir}/mo-resolver-server.crt" "${cert_dir}/mo-resolver-server.key" \
+                    "${cert_dir}/sidecar-flight-server.crt" "${cert_dir}/sidecar-flight-server.key" \
+                    "${cert_dir}/sidecar-read-client.crt" "${cert_dir}/sidecar-read-client.key"
+                /usr/local/bin/generate-dev-tls.sh "${cert_dir}"
+            fi
+        else
+            for cert_entry in "${cert_dir}"/* "${cert_dir}"/.[!.]* "${cert_dir}"/..?*; do
+                if [ -e "${cert_entry}" ]; then
+                    echo "[entrypoint] ERROR: development TLS refuses a pre-populated ${cert_dir}." >&2
+                    exit 1
+                fi
+            done
+            /usr/local/bin/generate-dev-tls.sh "${cert_dir}"
+        fi
+    fi
     for cert_file in \
         sidecar-flight-ca.crt mo-flight-client-ca.crt mo-flight-client.crt mo-flight-client.key \
         mo-resolver-server-ca.crt sidecar-read-client-ca.crt mo-resolver-server.crt mo-resolver-server.key \
