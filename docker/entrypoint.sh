@@ -34,9 +34,17 @@ ln -sfn "${LOG_DIR}/tpch/${LOG_TS}/run.log"  /opt/mo-tpch/run.log
 
 MO_PID=""
 SIDECAR_PID=""
+SIDECAR_STDIN_DIR=""
 
 cleanup() {
     echo "[entrypoint] Shutting down ..."
+    # Closing the parent's write end lets the DuckDB shell observe EOF. Its
+    # foreground atexit blocker then waits only until SIGINT stops HTTP/Flight.
+    exec 9>&- 2>/dev/null || true
+    if [ -n "${SIDECAR_STDIN_DIR}" ]; then
+        rm -f "${SIDECAR_STDIN_DIR}/pipe"
+        rmdir "${SIDECAR_STDIN_DIR}" 2>/dev/null || true
+    fi
     # Both MO and the sidecar httpserver use SIGINT for graceful shutdown.
     [ -n "$MO_PID" ]      && kill -INT "$MO_PID"      2>/dev/null || true
     [ -n "$SIDECAR_PID" ] && kill -INT "$SIDECAR_PID"  2>/dev/null || true
@@ -46,7 +54,17 @@ trap cleanup EXIT
 
 # --- Start sidecar first and wait for it to be ready ---
 echo "[entrypoint] Starting DuckDB sidecar on ${DUCKDB_HTTPSERVER_HOST}:${DUCKDB_HTTPSERVER_PORT} (logs: ${SIDECAR_LOG}) ..."
-/sidecar/duckdb < /dev/null >>"${SIDECAR_LOG}" 2>&1 &
+# Keep stdin open while the service is live. Redirecting /dev/null lets the
+# DuckDB shell enter process teardown before the HTTP atexit blocker runs;
+# CUDA then unloads underneath still-serving Flight workers.
+SIDECAR_STDIN_DIR="$(mktemp -d "${LOG_DIR}/.sidecar-stdin.XXXXXX")"
+SIDECAR_STDIN_FIFO="${SIDECAR_STDIN_DIR}/pipe"
+mkfifo "${SIDECAR_STDIN_FIFO}"
+exec 9<>"${SIDECAR_STDIN_FIFO}"
+rm -f "${SIDECAR_STDIN_FIFO}"
+rmdir "${SIDECAR_STDIN_DIR}"
+SIDECAR_STDIN_DIR=""
+/sidecar/duckdb <&9 9>&- >>"${SIDECAR_LOG}" 2>&1 &
 SIDECAR_PID=$!
 
 SIDECAR_URL="http://127.0.0.1:${DUCKDB_HTTPSERVER_PORT}"

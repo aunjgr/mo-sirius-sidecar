@@ -147,9 +147,9 @@ of tae_scanner + httpserver.
 ## Deploy
 
 Run the sidecar binary directly. The HTTP server auto-starts on the
-specified port; `DUCKDB_HTTPSERVER_FOREGROUND=1` blocks on an atexit
-handler so the process stays up after the DuckDB REPL ends. Send
-`SIGINT` to shut down gracefully.
+specified port. Keep the DuckDB shell alive while serving; the packaged Docker
+entrypoint holds stdin open for this purpose. Send `SIGINT` to shut down
+gracefully.
 
 ```bash
 # CPU sidecar
@@ -163,11 +163,23 @@ SIRIUS_LOG_LEVEL=info \
   ./build/release-gpu/duckdb
 ```
 
-When backgrounding without a TTY, redirect stdin to avoid `SIGTTIN`:
+When backgrounding without a TTY, keep a writer open on a private FIFO. Do not
+redirect stdin from `/dev/null`: that starts process teardown and unloads CUDA
+while Flight workers are still serving.
 
 ```bash
+fifo_dir=$(mktemp -d /tmp/mo-sidecar-stdin.XXXXXX)
+fifo="$fifo_dir/pipe"
+mkfifo "$fifo"
+exec 9<>"$fifo"
+rm -f "$fifo"
+rmdir "$fifo_dir"
 DUCKDB_HTTPSERVER_FOREGROUND=1 DUCKDB_HTTPSERVER_PORT=9876 \
-  ./build/release-gpu/duckdb < /dev/null > sidecar.log 2>&1 &
+  ./build/release-gpu/duckdb <&9 9>&- > sidecar.log 2>&1 &
+sidecar_pid=$!
+# Shutdown: close stdin, then stop HTTP/Flight.
+exec 9>&-
+kill -INT "$sidecar_pid"
 ```
 
 Set `SIRIUS_LOG_LEVEL=debug` for verbose GPU execution logs (very noisy).

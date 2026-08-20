@@ -15,7 +15,7 @@ message ExecuteSubstraitRequest {
   bytes plan = 6;
   bytes query_id = 7;
   bytes idempotency_key = 8;
-  uint64 account_id = 9;
+  optional uint64 account_id = 9;
 }
 
 // Flight Action.body for CancelExecution. Exactly one identity is required.
