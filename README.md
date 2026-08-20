@@ -222,7 +222,7 @@ canonical build entrypoint is `docker/build.sh`, which defaults to
 `podman` (override with `BUILD_ENGINE=docker`):
 
 ```bash
-./docker/build.sh                          # uses ../mo-tpch by default
+./docker/build.sh                          # uses ../mo-tpch @ mo-sirius-bench by default
 MO_TPCH_DIR=/path/to/mo-tpch ./docker/build.sh
 IMAGE_TAG=mo-sirius:dev ./docker/build.sh
 BUILD_ENGINE=docker ./docker/build.sh
