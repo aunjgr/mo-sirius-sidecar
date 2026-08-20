@@ -238,17 +238,21 @@ builder is pinned to the Go version declared in that source tree, and the
 Dockerfile tolerates archive ownership metadata so the same command works with
 rootless Podman as well as Docker.
 
-#### Pulling the published image
+#### Pulling the published images
 
-The validated Flight image is published as the immutable tag
-`ghcr.io/aunjgr/mo-sirius:flight-dd712e795f-db05a6c`. The GHCR package is
-public, so anyone can pull it without a registry login:
+The GHCR package is public, so anyone can pull an image without a registry
+login. Choose the tag that matches the intended mTLS model:
+
+| Tag | mTLS setup | Suitable for |
+|---|---|---|
+| `flight-dev-tls-v1` | Fresh in-container credentials | A one-container development benchmark without a certificate issuer |
+| `flight-dd712e795f-db05a6c` | Mounted directional credentials | A benchmark with externally managed mTLS identities |
 
 ```bash
-podman pull ghcr.io/aunjgr/mo-sirius:flight-dd712e795f-db05a6c
+podman pull ghcr.io/aunjgr/mo-sirius:flight-dev-tls-v1
 ```
 
-Docker users use `docker pull` with the same tag. The tag records MatrixOne
+Docker users use `docker pull` with the same tag. Both tags record MatrixOne
 `dd712e795f7734b90400941a8be396525ab32274` and Sirius
 `fc5e6765db019f72ba2228276ebb9503fd4f061e`; verify the files in
 `/etc/sidecar/` after starting a container if you need to audit provenance.
@@ -319,7 +323,7 @@ podman run -d --name mo-sirius-flight --device nvidia.com/gpu=all \
   -v $(pwd)/tpch-data:/opt/mo-tpch/data \
   -v $(pwd)/log:/log \
   -v $(pwd)/certs:/etc/sirius-certs:ro \
-  ghcr.io/aunjgr/mo-sirius:latest
+  ghcr.io/aunjgr/mo-sirius:flight-dd712e795f-db05a6c
 ```
 
 `MO_SIRIUS_FLIGHT=1` selects `launch-flight.toml`, starts the sidecar's TLS
@@ -343,8 +347,8 @@ or multiple CNs.
 
 #### Zero-config development TLS
 
-For a fresh, same-container benchmark, the `flight-dev-tls-v1` image release
-adds `MO_SIRIUS_FLIGHT_DEV_TLS=1`. It creates fresh, one-day, directional mTLS
+For a fresh, same-container benchmark, the public `flight-dev-tls-v1` image
+uses `MO_SIRIUS_FLIGHT_DEV_TLS=1`. It creates fresh, one-day, directional mTLS
 roots and leaf certificates inside a new container before it starts either the
 sidecar or MatrixOne. Nothing is baked into the image and nothing needs to be
 mounted at `/etc/sirius-certs`:
@@ -376,7 +380,9 @@ batches so a typical development GPU can start alongside its display and other
 processes. It is a safe startup profile, not a performance profile.
 
 Confirm the running image was built from the MatrixOne and Sirius revisions you
-expect, then run the GPU TPC-H path through Flight:
+expect, then run the GPU TPC-H path through Flight. The examples below use the
+mounted-certificate container name; replace `mo-sirius-flight` with
+`mo-sirius-flight-dev` for the zero-config development image:
 
 ```bash
 podman exec mo-sirius-flight sh -c \

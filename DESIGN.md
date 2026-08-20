@@ -1771,10 +1771,16 @@ DuckDB instance running Sirius and tae_scanner extensions on a GPU-equipped mach
 
 **Startup:**
 ```bash
-# Start the bundled local-CN Flight profile (the Docker entrypoint supplies
-# the fixed loopback endpoints and the mTLS environment from this mount).
-MO_SIRIUS_FLIGHT=1 \
-  docker run --gpus all -v ./certs:/etc/sirius-certs:ro mo-sirius:latest
+# Public, same-container development benchmark: the entrypoint generates
+# ephemeral directional mTLS credentials and keeps Flight on loopback.
+docker run --gpus all -p 6001:6001 -p 8888:8888 \
+  -e MO_SIRIUS_FLIGHT=1 -e MO_SIRIUS_FLIGHT_DEV_TLS=1 \
+  ghcr.io/aunjgr/mo-sirius:flight-dev-tls-v1
+
+# Externally managed mTLS identities for the same local-CN profile:
+docker run --gpus all -p 6001:6001 -p 8888:8888 \
+  -e MO_SIRIUS_FLIGHT=1 -v ./certs:/etc/sirius-certs:ro \
+  ghcr.io/aunjgr/mo-sirius:flight-dd712e795f-db05a6c
 ```
 
 ### 18.3 How Sirius Works Today
