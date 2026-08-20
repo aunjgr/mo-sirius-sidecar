@@ -2,7 +2,32 @@
 set -euo pipefail
 
 MO_DEBUG_HTTP="${MO_DEBUG_HTTP:-:8888}"
-MO_LAUNCH_CONF="${MO_LAUNCH_CONF:-/etc/launch/launch.toml}"
+MO_SIRIUS_FLIGHT="${MO_SIRIUS_FLIGHT:-0}"
+if [ "${MO_SIRIUS_FLIGHT}" = "1" ]; then
+    MO_LAUNCH_CONF="${MO_LAUNCH_CONF:-/etc/launch/launch-flight.toml}"
+    cert_dir=/etc/sirius-certs
+    for cert_file in \
+        sidecar-flight-ca.crt mo-flight-client-ca.crt mo-flight-client.crt mo-flight-client.key \
+        mo-resolver-server-ca.crt sidecar-read-client-ca.crt mo-resolver-server.crt mo-resolver-server.key \
+        sidecar-flight-server.crt sidecar-flight-server.key \
+        sidecar-read-client.crt sidecar-read-client.key; do
+        if [ ! -r "${cert_dir}/${cert_file}" ]; then
+            echo "[entrypoint] ERROR: Flight profile requires ${cert_dir}/${cert_file}." >&2
+            exit 1
+        fi
+    done
+    export MO_SIDECAR_FLIGHT_HOST=127.0.0.1
+    export MO_SIDECAR_FLIGHT_PORT=32010
+    export MO_SIDECAR_FLIGHT_CERT="${cert_dir}/sidecar-flight-server.crt"
+    export MO_SIDECAR_FLIGHT_KEY="${cert_dir}/sidecar-flight-server.key"
+    export MO_SIDECAR_FLIGHT_CLIENT_CA="${cert_dir}/mo-flight-client-ca.crt"
+    export MO_SIDECAR_READ_URL=https://localhost:32011/internal/v1/sidecar/read/resolve
+    export MO_SIDECAR_READ_CA="${cert_dir}/mo-resolver-server-ca.crt"
+    export MO_SIDECAR_READ_CLIENT_CERT="${cert_dir}/sidecar-read-client.crt"
+    export MO_SIDECAR_READ_CLIENT_KEY="${cert_dir}/sidecar-read-client.key"
+else
+    MO_LAUNCH_CONF="${MO_LAUNCH_CONF:-/etc/launch/launch.toml}"
+fi
 
 export SIRIUS_CONFIG_FILE="${SIRIUS_CONFIG_FILE:-/etc/sidecar/sirius.yaml}"
 export DUCKDB_HTTPSERVER_HOST="${DUCKDB_HTTPSERVER_HOST:-0.0.0.0}"

@@ -5,7 +5,10 @@ DuckDB-based query sidecar for MatrixOne, powered by the
 [MatrixOne](https://github.com/matrixorigin/matrixone) rewrites and forwards
 queries annotated with `/*+ SIDECAR */` (DuckDB on CPU) or
 `/*+ SIDECAR GPU */` (SiriusDB on GPU) to this sidecar to take advantage of GPU
-for analytic query processing.
+for analytic query processing. The legacy HTTP/SQL path remains available for
+compatibility. The Sirius path is an explicit Substrait/Arrow Flight contract;
+it preserves the MatrixOne logical plan and does not send SQL, manifests, or
+storage credentials to the sidecar.
 
 The production offload path accepts a strict binary Substrait plan over
 mutually-authenticated Arrow Flight. It resolves opaque, expiring `TaeRead`
@@ -184,7 +187,7 @@ kill -INT "$sidecar_pid"
 
 Set `SIRIUS_LOG_LEVEL=debug` for verbose GPU execution logs (very noisy).
 
-### Production Flight endpoint
+### Standalone Flight endpoint
 
 The Flight endpoint is disabled unless `MO_SIDECAR_FLIGHT_PORT` is set. Once
 enabled, every TLS/read-service setting is required and checked before the port
@@ -208,6 +211,10 @@ The wire schema and server behavior are documented in
 canonical capability document; clients hash those exact bytes with SHA-256 and
 include the digest in both the execution envelope and every `TaeRead`.
 
+The supported bundled deployment is the local-CN profile below. Use these raw
+environment variables only when starting a sidecar separately from MatrixOne;
+they deliberately expose all transport choices and are not a multi-CN recipe.
+
 ### Container image (podman / docker)
 
 A combined MO + GPU sidecar image is defined in `docker/Dockerfile`. The
@@ -219,7 +226,17 @@ canonical build entrypoint is `docker/build.sh`, which defaults to
 MO_TPCH_DIR=/path/to/mo-tpch ./docker/build.sh
 IMAGE_TAG=mo-sirius:dev ./docker/build.sh
 BUILD_ENGINE=docker ./docker/build.sh
+
+# Build MatrixOne from a specific repository and revision.
+MO_REPO=https://github.com/aunjgr/matrixone.git MO_REF=<revision> \
+  ./docker/build.sh
 ```
+
+The build records the resolved MatrixOne and Sirius revisions at
+`/etc/sidecar/matrixone-ref` and `/etc/sidecar/sirius-ref`. The MatrixOne
+builder is pinned to the Go version declared in that source tree, and the
+Dockerfile tolerates archive ownership metadata so the same command works with
+rootless Podman as well as Docker.
 
 A typical run with all bind-mounts (data, TPC-H scratch, logs, sirius
 config) — daemonized so we can drive it later via `podman exec`:
@@ -251,6 +268,42 @@ What each mount is for:
   `DATA_DIR` env to override.
 - **`/log`** — see "Container logs" below.
 
+#### Flight/Substrait benchmark profile
+
+The image defaults to the legacy HTTP profile above. To start one local CN and
+its paired GPU sidecar with the authenticated Flight path, opt in explicitly:
+
+```bash
+mkdir -p $(pwd)/{mo-data,tpch-data,log,certs}
+podman run -d --name mo-sirius-flight --device nvidia.com/gpu=all \
+  -p 6001:6001 -p 8888:8888 \
+  -e MO_SIRIUS_FLIGHT=1 \
+  -v $(pwd)/mo-data:/mo-data \
+  -v $(pwd)/tpch-data:/opt/mo-tpch/data \
+  -v $(pwd)/log:/log \
+  -v $(pwd)/certs:/etc/sirius-certs:ro \
+  ghcr.io/aunjgr/mo-sirius:latest
+```
+
+`MO_SIRIUS_FLIGHT=1` selects `launch-flight.toml`, starts the sidecar's TLS
+Flight service on the container-only loopback address, and starts the MatrixOne
+read resolver with mTLS. No Flight port is published to the host. The entrypoint
+sets the endpoint and credential environment itself; do not override individual
+`MO_SIDECAR_FLIGHT_*` or `MO_SIDECAR_READ_*` variables for this profile.
+
+The read-only `certs` mount must contain these PEM files:
+
+| Direction | Server CA | Client CA | Server identity | Client identity |
+|---|---|---|---|---|
+| MatrixOne CN → sidecar Flight | `sidecar-flight-ca.crt` | `mo-flight-client-ca.crt` | `sidecar-flight-server.crt`, `sidecar-flight-server.key` | `mo-flight-client.crt`, `mo-flight-client.key` |
+| Sidecar → MatrixOne resolver | `mo-resolver-server-ca.crt` | `sidecar-read-client-ca.crt` | `mo-resolver-server.crt`, `mo-resolver-server.key` | `sidecar-read-client.crt`, `sidecar-read-client.key` |
+
+The Flight server certificate must identify `sidecar`, and the resolver server
+certificate must identify `localhost`. The profile intentionally enables the
+non-durable, local lease adapter and disables GC in its paired TN. It is for a
+one-CN benchmark only: do not use it for production traffic, restart recovery,
+or multiple CNs.
+
 **Running TPC-H benchmarks.** The image bundles
 [`mo-tpch`](https://github.com/matrixorigin/mo-tpch) at `/opt/mo-tpch`
 with a pre-built `dbgen`, the schema (`mo.ddl`), all 22 queries, and
@@ -272,10 +325,14 @@ MO_HOST=mo MO_PORT=6001 tpch-bench 1
 DATA_DIR=/data/sf10 tpch-bench 10     # bind-mount /data for large SFs
 ```
 
-`ENGINE=cpu|gpu` injects the corresponding sidecar hint as the first
-line of every query before piping to `mariadb --comments`, so MO
-forwards the rewritten SQL to the in-container sidecar at
-`http://127.0.0.1:9999`.
+`ENGINE=cpu|gpu` injects the corresponding sidecar hint as the first line of
+every query before piping to `mariadb --comments`. In the default image profile
+MO forwards rewritten SQL to `http://127.0.0.1:9999`. With
+`MO_SIRIUS_FLIGHT=1`, use `ENGINE=gpu`: MO exports its logical plan as
+Substrait and streams results through the local mTLS Flight connection instead.
+The Flight schema represents MatrixOne `CHAR(n)` as `VARCHAR(n)` without
+trimming or padding; MatrixOne converts the result back to the original output
+type.
 
 To drive the bench from the host against the daemonized container above,
 use `podman exec`:
@@ -328,7 +385,8 @@ bypass them entirely:
 
 - **Tune knobs via environment variables** (see table below) — all
   `SIRIUS_*`, `DUCKDB_HTTPSERVER_*`, `MO_DEBUG_HTTP`, and
-  `MO_LAUNCH_CONF` are passed through:
+  `MO_LAUNCH_CONF` are passed through. `MO_SIRIUS_FLIGHT=1` owns the
+  Flight endpoint variables and requires its bundled launch profile:
 
   ```bash
   podman run --device nvidia.com/gpu=all ... \
@@ -348,6 +406,8 @@ bypass them entirely:
 | `DUCKDB_HTTPSERVER_FOREGROUND` | `0` | Set to `1` to block after startup (daemon mode) |
 | `SIRIUS_LOG_LEVEL` | `warn` | Sirius GPU engine log level (`info`, `debug`, `trace`) |
 | `SIRIUS_TAE_BASELINE_COLS` | `4` | GPU TAE scan: projected-col count at which `scan_task_batch_size` is used as-is. Effective cap scales as `scan_task_batch_size × baseline / proj_cols` (floored at 32MB); wider projections get smaller per-task batches to reduce GPU tail latency. `0` disables scaling. |
+| `MO_SIRIUS_FLIGHT` | `0` | Set to `1` to select the bundled local-CN Substrait/Flight benchmark profile and require `/etc/sirius-certs` |
+| `MO_LAUNCH_CONF` | `/etc/launch/launch.toml` | MO launch manifest; defaults to `launch-flight.toml` when `MO_SIRIUS_FLIGHT=1` |
 
 ### Manual start (interactive)
 

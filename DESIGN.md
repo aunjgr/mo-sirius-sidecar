@@ -19,12 +19,12 @@ The sidecar consists of statically-linked DuckDB extensions:
 - **mo_sidecar** — mTLS Arrow Flight, strict Substrait admission, authenticated
   `TaeRead` resolution, direct Sirius execution, and bounded result streaming
 
-The SQL rewrite/JSON path described below is retained as the prototype and
-benchmark path. The production path does not rewrite or stringify SQL: MO sends
-a bounded logical Substrait plan over Flight, the sidecar resolves opaque
-query-scoped read references over mTLS, and Sirius streams Arrow batches under
-one-batch backpressure. See [`mo-sidecar/README.md`](mo-sidecar/README.md) for
-the production wire and lifecycle contract.
+The SQL rewrite/JSON path described below is retained for compatibility and
+benchmark comparison. The current Sirius path does not rewrite or stringify
+SQL: MO sends a bounded logical Substrait plan over Flight, the sidecar resolves
+opaque query-scoped read references over mTLS, and Sirius streams Arrow batches
+under one-batch backpressure. See [`mo-sidecar/README.md`](mo-sidecar/README.md)
+for the wire and lifecycle contract.
 
 **Key properties:**
 - Zero-copy read path: `pread()` → LZ4 decompress → fill DuckDB vectors
@@ -359,6 +359,12 @@ Offset  Size  Field
 | T_float64 | 31 | 8B | DOUBLE |
 
 ### 5.3 String / Binary Types
+
+For the Flight/Substrait path, MatrixOne canonicalizes `CHAR(n)` to
+Substrait `VARCHAR(n)` on the wire without trimming or padding its bytes. The
+sidecar therefore does not need a distinct fixed-`CHAR` execution type, and
+MatrixOne converts an Arrow UTF-8 result back to the original `CHAR` output
+type.
 
 | MO Type | OID | Size | DuckDB Type |
 |---------|-----|------|-------------|
@@ -1686,7 +1692,8 @@ Measured on 24-core machine with local NVMe storage, DuckDB CLI (24 threads):
 ## 18. MO → Sidecar Integration Architecture
 
 This section describes how MatrixOne routes analytical queries to the DuckDB sidecar
-for accelerated execution. The implemented approach is **SQL String Forwarding via HTTP**.
+for accelerated execution. The legacy compatibility path is SQL forwarding via
+HTTP. The current Sirius path is authenticated Substrait over Arrow Flight.
 
 ### 18.1 Three Integration Paths
 
@@ -1694,12 +1701,11 @@ for accelerated execution. The implemented approach is **SQL String Forwarding v
 |---|---|---|---|
 | **User interface** | DuckDB CLI directly | Transparent (MO SQL) | Transparent (MO SQL) |
 | **MO involvement** | None | Query router + SQL rewriter | Query router + Substrait converter |
-| **What crosses gRPC** | N/A (no gRPC) | SQL string | Binary Substrait protobuf |
+| **Transport** | N/A | HTTP + JSON | Arrow Flight over mTLS |
+| **What crosses the boundary** | N/A | Rewritten SQL | Bounded Substrait protobuf + Arrow batches |
 | **MO optimizer used?** | No | No (DuckDB re-plans) | Yes (plan preserved) |
-| **Sirius changes** | None | None | 1 line (tae_scan scan type) |
-| **MO changes** | None | ~500 LOC (router + gRPC) | ~2000 LOC (router + converter) |
-| **Plan quality** | DuckDB optimizer only | DuckDB optimizer only | MO + DuckDB combined |
-| **Recommended for** | Dev/testing | Quick production MVP | Production target |
+| **Storage authority** | Local configuration | Sidecar-visible files | MatrixOne-signed opaque `TaeRead` references |
+| **Status** | Development | Legacy compatibility | Current Sirius integration |
 
 **Path 1: Manual CLI** — User talks directly to DuckDB+Sirius:
 ```sql
@@ -1713,14 +1719,14 @@ CALL gpu_execution('SELECT l_returnflag, SUM(l_quantity)
 forwards to sidecar:
 ```
 User → MO → rewrites "lineitem" → "tae_scan('/manifest/lineitem.json')"
-         → sends SQL string via gRPC → Sirius sidecar → GPU → results → MO → client
+         → HTTP POST → Sirius sidecar → GPU → JSON result → MO → client
 ```
 
-**Path 3: Substrait Plan Exchange** — MO builds plan, converts to Substrait protobuf,
-sends binary plan to sidecar:
+**Path 3: Substrait Plan Exchange** — MO builds and validates its logical plan,
+then sends a bounded Substrait protobuf to the sidecar over authenticated Flight:
 ```
-User → MO → builds optimized plan → converts to Substrait bytes
-         → sends protobuf via gRPC → Sirius from_substrait() → GPU → results → MO → client
+User → MO → logical plan → Substrait + signed TaeRead references
+         → Flight BeginExecution → Sirius GPU → Arrow batches → MO → client
 ```
 
 ### 18.2 Sirius Sidecar Process
@@ -1737,9 +1743,13 @@ DuckDB instance running Sirius and tae_scanner extensions on a GPU-equipped mach
 │  ├── sirius extension (GPU execution via CUDA/cuDF)            │
 │  └── substrait extension (plan deserialization)                │
 │                                                                │
-│  gRPC Server                                                   │
-│  ├── ExecuteSQL(sql_string) → Arrow IPC batches                │
-│  └── ExecutePlan(substrait_bytes) → Arrow IPC batches          │
+│  Arrow Flight server (mTLS)                                    │
+│  ├── GetCapabilities → canonical capability document           │
+│  ├── BeginExecution(Substrait + opaque TaeRead) → ticket       │
+│  └── DoGet(ticket) → bounded Arrow record batches              │
+│                                                                │
+│  HTTPS MatrixOne resolver (mTLS client)                        │
+│  └── TaeRead → authenticated snapshot manifest                 │
 │                                                                │
 │  GPU Resources                                                 │
 │  ├── CUDA streams + cuDF operators                             │
@@ -1761,10 +1771,10 @@ DuckDB instance running Sirius and tae_scanner extensions on a GPU-equipped mach
 
 **Startup:**
 ```bash
-# Start sidecar (loads extensions, starts gRPC server)
-sirius-sidecar --port 50051 \
-    --extensions "sirius,tae_scanner" \
-    --data-dir /mo-data/shared/
+# Start the bundled local-CN Flight profile (the Docker entrypoint supplies
+# the fixed loopback endpoints and the mTLS environment from this mount).
+MO_SIRIUS_FLIGHT=1 \
+  docker run --gpus all -v ./certs:/etc/sirius-certs:ro mo-sirius:latest
 ```
 
 ### 18.3 How Sirius Works Today
@@ -1799,7 +1809,9 @@ via nvCOMP LZ4 + custom CUDA kernels. See §13 for details.
 ### 18.4 Substrait as the Plan Exchange Format
 
 Substrait is a cross-database query plan format supported by DuckDB (via extension),
-Apache Arrow, Velox, and others. Sirius already bundles the DuckDB Substrait extension.
+Apache Arrow, Velox, and others. Sirius bundles the DuckDB Substrait extension,
+but MatrixOne's Flight path uses its strict `matrixone.sirius.v1.TaeRead`
+extension rather than DuckDB's generic SQL helper as the data source contract.
 
 **Key Substrait concepts:**
 - **Plan**: Top-level container with relations and extension references
@@ -1816,7 +1828,7 @@ CALL from_substrait(x'12090a...');                                     → resul
 CALL from_substrait_json('{"relations":[...]}');                       → results
 ```
 
-### 18.5 Path 2 Detail: SQL String Forwarding
+### 18.5 Legacy Path 2 Detail: SQL String Forwarding
 
 MO rewrites SQL, replacing table names with `tae_scan()` calls, and forwards the
 SQL string to the sidecar. The sidecar calls `gpu_execution()` internally.
