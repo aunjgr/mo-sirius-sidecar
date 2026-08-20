@@ -11,6 +11,10 @@ if [ "$#" -ne 1 ] || [ -z "$1" ]; then
 fi
 
 cert_dir=$1
+# The Sirius/Pixi build environment can leave OPENSSL_CONF pointing at a path
+# that does not exist in the slim runtime image. Development credentials must
+# always use the runtime distribution's known configuration instead.
+export OPENSSL_CONF=/etc/ssl/openssl.cnf
 umask 077
 mkdir -p "${cert_dir}"
 chmod 700 "${cert_dir}"
