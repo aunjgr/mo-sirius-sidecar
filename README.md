@@ -380,8 +380,8 @@ batches so a typical development GPU can start alongside its display and other
 processes. It is a safe startup profile, not a performance profile.
 
 Confirm the running image was built from the MatrixOne and Sirius revisions you
-expect, then run the GPU TPC-H path through Flight. The examples below use the
-mounted-certificate container name; replace `mo-sirius-flight` with
+expect, then attempt the GPU TPC-H path through Flight. The examples below use
+the mounted-certificate container name; replace `mo-sirius-flight` with
 `mo-sirius-flight-dev` for the zero-config development image:
 
 ```bash
@@ -389,8 +389,9 @@ podman exec mo-sirius-flight sh -c \
   'printf "MatrixOne: "; cat /etc/sidecar/matrixone-ref; \
    printf "Sirius: "; cat /etc/sidecar/sirius-ref'
 
-# Complete SF1 run. The Flight profile turns ENGINE=gpu into explicit
-# MatrixOne Substrait/Flight offload rather than legacy HTTP forwarding.
+# Run an SF1 GPU attempt. See the validation status below before treating its
+# output as a complete TPC-H pass. The Flight profile turns ENGINE=gpu into
+# explicit MatrixOne Substrait/Flight offload rather than legacy HTTP forwarding.
 podman exec mo-sirius-flight bash -lc 'ENGINE=gpu tpch-bench 1'
 
 # Reuse an already loaded SF10 data set and run queries only.
@@ -406,13 +407,38 @@ generate → create-tables → load → query pipeline, with an `ENGINE`
 switch to route queries through MO native, the CPU sidecar, or the
 GPU sidecar:
 
+**Validation status.** `flight-dev-tls-v1` is validated for zero-config Flight
+startup and a simple explicitly hinted query. It is **not** yet a certified
+release in which all 22 TPC-H queries have passed on Sirius. Establish a native
+baseline first, flush the loaded TPC-H tables, then reuse the data for the GPU
+attempt; compare the per-query outputs under `/log/tpch/` before treating a
+result as a TPC-H pass.
+
+For example, from the host after starting `mo-sirius-flight-dev`:
+
+```bash
+# Native baseline: generate, create, load, and run SF1.
+podman exec mo-sirius-flight-dev bash -lc 'tpch-bench 1'
+
+# A native load does not need a sidecar flush. Flush before the GPU query-only
+# attempt so Sirius can resolve the committed TAE objects.
+for tbl in nation region part supplier partsupp customer orders lineitem; do
+  podman exec mo-sirius-flight-dev mariadb --skip-ssl -h127.0.0.1 -P6001 -udump -p111 \
+    -e "select mo_ctl('dn', 'flush', 'tpch_1g.${tbl}');" >/dev/null
+done
+
+# Reuse the loaded data for the all-query GPU attempt.
+podman exec mo-sirius-flight-dev bash -lc \
+  'ENGINE=gpu GEN=0 CTAB=0 LOAD=0 tpch-bench 1'
+```
+
 ```bash
 # inside the running container (or via podman exec):
-tpch-bench 1                          # SF=1, all phases, ENGINE=native (default)
+tpch-bench 1                          # SF=1 native baseline, all phases
 SF=10 tpch-bench                      # SF=10
-GEN=0 LOAD=0 tpch-bench 10            # SF=10, queries only
-ENGINE=cpu  GEN=0 LOAD=0 tpch-bench 10   # route via CPU sidecar (/*+ SIDECAR */)
-ENGINE=gpu  GEN=0 LOAD=0 tpch-bench 10   # route via GPU sidecar (/*+ SIDECAR GPU */)
+GEN=0 CTAB=0 LOAD=0 tpch-bench 10     # reuse loaded SF10 data, native queries only
+ENGINE=cpu  GEN=0 CTAB=0 LOAD=0 tpch-bench 10   # route via CPU sidecar (/*+ SIDECAR */)
+ENGINE=gpu  GEN=0 CTAB=0 LOAD=0 tpch-bench 10   # route via GPU sidecar (/*+ SIDECAR GPU */)
 
 # override MO connection or data location:
 MO_HOST=mo MO_PORT=6001 tpch-bench 1
