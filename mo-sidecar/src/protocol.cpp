@@ -3,6 +3,7 @@
 
 #include "mo_sidecar/protocol.hpp"
 
+#include "offload/stream_read.hpp"
 #include "offload/tae_read.hpp"
 
 #include <openssl/evp.h>
@@ -15,8 +16,9 @@ namespace matrixone::sidecar {
 namespace {
 
 constexpr std::string_view k_capability_document =
-    "{\"protocol_version\":3,\"substrait_version\":\"0.78.0\","
+    "{\"protocol_version\":4,\"substrait_version\":\"0.78.0\","
     "\"tae_read_protocol_version\":2,\"tae_read_feature_bits\":0,"
+    "\"stream_read_protocol_version\":1,\"stream_read_feature_bits\":0,"
     "\"operators\":[\"read\",\"filter\",\"project\",\"aggregate\",\"sort\","
     "\"fetch\",\"join\",\"reference\"],"
     "\"join_types\":[\"inner\",\"left\",\"right\",\"left_semi\",\"left_anti\","
@@ -34,7 +36,15 @@ constexpr std::string_view k_capability_document =
     "\"like\","
     "\"starts_with\",\"substring\",\"extract\"],"
     "\"aggregate_functions\":[\"count\",\"sum\",\"min\",\"max\",\"avg\"],"
-    "\"transport\":\"arrow-flight\",\"sirius_execution_contract\":1,"
+    "\"transport\":\"arrow-flight\",\"stream_input_transport\":\"flight-do-put-"
+    "mo-native\","
+    "\"mo_native_batch_codec_version\":1,\"mo_type_size\":16,\"mo_varlena_"
+    "size\":24,"
+    "\"mo_native_endian\":\"little\","
+    "\"stream_input_ack\":\"ready-consumed-final-v1\","
+    "\"stream_input_slots_per_read\":1,"
+    "\"max_stream_inputs\":16,\"max_stream_input_batch_bytes\":4194304,"
+    "\"sirius_execution_contract\":1,"
     "\"max_plan_bytes\":16777216}";
 
 class wire_reader {
@@ -132,10 +142,10 @@ execute_request parse_execute_request(std::string_view bytes) {
 	std::uint64_t seen = 0;
 	while (!reader.done()) {
 		const auto tag = reader.varint();
-		expect_field(tag, 9, seen);
+		expect_field(tag, 10, seen);
 		const auto field = static_cast<unsigned>(tag >> 3U);
 		const auto wire = static_cast<unsigned>(tag & 7U);
-		const bool integer = field == 1 || field == 4 || field == 5 || field == 9;
+		const bool integer = field == 1 || field == 4 || field == 5 || field == 9 || field == 10;
 		if (wire != (integer ? 0U : 2U)) {
 			throw std::invalid_argument("wrong protobuf wire type");
 		}
@@ -172,14 +182,92 @@ execute_request parse_execute_request(std::string_view bytes) {
 		case 9:
 			result.account_id = reader.varint();
 			break;
+		case 10:
+			result.max_input_batch_bytes = reader.varint();
+			break;
 		default:
 			throw std::invalid_argument("unknown ExecuteSubstrait field");
 		}
 	}
-	if (seen != 0x1ffU || result.query_id.size() != 16U || result.idempotency_key.size() != k_sha256_bytes) {
+	if (seen != 0x3ffU || result.query_id.size() != 16U || result.idempotency_key.size() != k_sha256_bytes) {
 		throw std::invalid_argument("ExecuteSubstrait request is missing a field");
 	}
 	return result;
+}
+
+upload_input_request parse_upload_input_request(std::string_view bytes) {
+	if (bytes.empty() || bytes.size() > 2U * (k_sha256_bytes + 2U)) {
+		throw std::invalid_argument("UploadInput request is empty or too large");
+	}
+	wire_reader reader(bytes);
+	upload_input_request result;
+	std::uint64_t seen = 0;
+	while (!reader.done()) {
+		const auto tag = reader.varint();
+		expect_field(tag, 2, seen);
+		if ((tag & 7U) != 2U) {
+			throw std::invalid_argument("wrong UploadInput wire type");
+		}
+		switch (tag >> 3U) {
+		case 1:
+			result.ticket = reader.bytes(k_sha256_bytes);
+			break;
+		case 2:
+			result.stream_ref = reader.bytes(k_sha256_bytes);
+			break;
+		default:
+			throw std::invalid_argument("unknown UploadInput field");
+		}
+	}
+	if (seen != 0x3U || result.ticket.size() != k_sha256_bytes || result.stream_ref.size() != k_sha256_bytes) {
+		throw std::invalid_argument("UploadInput requires a ticket and stream reference");
+	}
+	return result;
+}
+
+std::string serialize_upload_input_ack(const upload_input_ack &ack) {
+	std::string output;
+	append_uint(output, 1, ack.acknowledged_batches);
+	append_uint(output, 2, ack.rows);
+	append_uint(output, 3, ack.bytes);
+	if (ack.complete) {
+		append_uint(output, 4, 1);
+	}
+	if (ack.not_needed) {
+		append_uint(output, 5, 1);
+	}
+	if (ack.ready) {
+		append_uint(output, 6, 1);
+	}
+	return output;
+}
+
+native_batch_frame parse_native_batch_frame(std::string_view bytes) {
+	static constexpr std::string_view magic = "MOB1";
+	if (bytes.size() < k_native_batch_frame_header_bytes || bytes.substr(0, magic.size()) != magic) {
+		throw std::invalid_argument("invalid MO native batch frame magic or length");
+	}
+	auto read_u16 = [&](std::size_t offset) {
+		return static_cast<std::uint16_t>(static_cast<unsigned char>(bytes[offset])) |
+		       static_cast<std::uint16_t>(static_cast<unsigned char>(bytes[offset + 1])) << 8U;
+	};
+	auto read_u64 = [&](std::size_t offset) {
+		std::uint64_t value = 0;
+		for (unsigned i = 0; i < 8; ++i) {
+			value |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[offset + i])) << (i * 8U);
+		}
+		return value;
+	};
+	if (read_u16(4) != k_native_batch_codec_version || read_u16(6) != 0) {
+		throw std::invalid_argument("unsupported MO native batch frame version or flags");
+	}
+	const auto sequence = read_u64(8);
+	const auto payload_size = read_u64(16);
+	if (sequence == 0 || payload_size == 0 || payload_size > k_max_stream_input_batch_bytes ||
+	    payload_size != bytes.size() - k_native_batch_frame_header_bytes) {
+		throw std::invalid_argument("invalid MO native batch frame sequence or payload length");
+	}
+	return native_batch_frame {sequence, bytes.substr(k_native_batch_frame_header_bytes)};
 }
 
 cancel_request parse_cancel_request(std::string_view bytes) {
@@ -262,6 +350,21 @@ std::string serialize_tae_read(const sirius::offload::tae_read &request) {
 	append_bytes(output, 10, request.capability_hash);
 	append_uint(output, 11, request.expires_at_unix_ms);
 	append_uint(output, 12, request.database_id);
+	return output;
+}
+
+std::string serialize_stream_read(const sirius::offload::stream_read &request) {
+	std::string output;
+	output.reserve(256 + request.stream_ref.size() + request.query_id.size());
+	append_uint(output, 1, request.protocol_version);
+	append_uint(output, 2, request.feature_bits);
+	append_bytes(output, 3, request.stream_ref);
+	append_bytes(output, 4, request.query_id);
+	append_required_uint(output, 5, request.account_id);
+	append_bytes(output, 6, request.snapshot_ts);
+	append_bytes(output, 7, request.schema_digest);
+	append_bytes(output, 8, request.capability_hash);
+	append_uint(output, 9, request.expires_at_unix_ms);
 	return output;
 }
 

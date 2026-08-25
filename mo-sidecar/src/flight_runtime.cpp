@@ -4,6 +4,7 @@
 #include "mo_sidecar/flight_runtime.hpp"
 
 #include "mo_sidecar/protocol.hpp"
+#include "mo_sidecar/stream_input.hpp"
 #include "mo_sidecar/tae_read_resolver.hpp"
 
 #include "execution/sirius_execution_evidence.hpp"
@@ -19,12 +20,14 @@
 #include <duckdb/common/arrow/arrow_converter.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
+#include <grpcpp/server_builder.h>
 
 #include <openssl/rand.h>
 
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <limits>
@@ -141,7 +144,8 @@ public:
 		// observe in one transaction. The entry owns the connection through
 		// quiescence; Connection rolls this read-only transaction back on destroy.
 		connection_->BeginTransaction();
-		matrixone_tae_read_resolver resolver(*connection_, config_, request_.query_id, request_.account_id);
+		matrixone_tae_read_resolver resolver(*connection_, config_, request_.query_id, request_.account_id,
+		                                     stream_inputs_);
 		execution_ = sirius::offload::prepare_substrait(*connection_->context, request_.plan, resolver, evidence_);
 		schema_ = make_arrow_schema(*connection_->context, execution_->schema());
 	}
@@ -169,6 +173,36 @@ public:
 	}
 	const std::string &idempotency_key() const noexcept {
 		return request_.idempotency_key;
+	}
+	std::uint64_t max_input_batch_bytes() const noexcept {
+		return request_.max_input_batch_bytes;
+	}
+
+	arrow::Result<std::shared_ptr<stream_input>> attach_input(const std::string &stream_ref) {
+		auto input = stream_inputs_.find(stream_ref);
+		if (!input) {
+			return arrow::Status::KeyError("unknown StreamRead input reference");
+		}
+		const auto status = input->attach();
+		if (!status.ok()) {
+			return status;
+		}
+		stream_inputs_.handler_attached();
+		return input;
+	}
+
+	void detach_input(const std::shared_ptr<stream_input> &input) noexcept {
+		if (input) {
+			input->detach();
+			stream_inputs_.handler_detached();
+		}
+		condition_.notify_all();
+		maybe_notify_terminal();
+	}
+
+	void fail_input(const std::string &error) noexcept {
+		stream_inputs_.cancel_all(error);
+		(void)cancel(false);
 	}
 	bool replayable() {
 		std::lock_guard lock(mutex_);
@@ -227,7 +261,6 @@ public:
 	}
 
 	bool cancel(bool timed_out) {
-		bool notify_terminal = false;
 		bool unstarted = false;
 		{
 			std::lock_guard lock(mutex_);
@@ -244,21 +277,16 @@ public:
 			}
 			unstarted = !worker_.joinable();
 		}
+		stream_inputs_.cancel_all(timed_out ? "sidecar execution deadline expired" : "sidecar execution was cancelled");
 		execution_->cancel();
 		connection_->Interrupt();
 		(void)evidence_->finish(sirius::execution_outcome::CANCELLED);
 		if (unstarted) {
 			std::lock_guard lock(mutex_);
 			quiesced_ = true;
-			if (!terminal_notified_) {
-				terminal_notified_ = true;
-				notify_terminal = true;
-			}
 		}
 		condition_.notify_all();
-		if (notify_terminal) {
-			on_terminal_(ticket_);
-		}
+		maybe_notify_terminal();
 		return true;
 	}
 
@@ -268,7 +296,7 @@ public:
 		    std::chrono::system_clock::time_point(std::chrono::milliseconds(request_.deadline_unix_ms));
 		{
 			std::unique_lock lock(mutex_);
-			while (!quiesced_) {
+			while (!quiesced_ || stream_inputs_.active_handlers() != 0) {
 				lock.unlock();
 				const bool stopped = stop_waiting && stop_waiting();
 				lock.lock();
@@ -344,7 +372,6 @@ private:
 	}
 
 	void finish(arrow::Status status, sirius::execution_outcome outcome) noexcept {
-		bool notify_terminal = false;
 		{
 			std::lock_guard lock(mutex_);
 			if (!terminal_) {
@@ -352,14 +379,27 @@ private:
 				terminal_status_ = std::move(status);
 			}
 			quiesced_ = true;
-			if (!terminal_notified_) {
-				terminal_notified_ = true;
-				notify_terminal = true;
-			}
+		}
+		if (outcome == sirius::execution_outcome::SUCCEEDED) {
+			stream_inputs_.mark_all_not_needed();
+		} else {
+			stream_inputs_.cancel_all("sidecar execution terminated");
 		}
 		(void)evidence_->finish(outcome);
 		condition_.notify_all();
-		if (notify_terminal) {
+		maybe_notify_terminal();
+	}
+
+	void maybe_notify_terminal() noexcept {
+		bool notify = false;
+		{
+			std::lock_guard lock(mutex_);
+			if (quiesced_ && stream_inputs_.active_handlers() == 0 && !terminal_notified_) {
+				terminal_notified_ = true;
+				notify = true;
+			}
+		}
+		if (notify) {
 			on_terminal_(ticket_);
 		}
 	}
@@ -368,6 +408,7 @@ private:
 	execute_request request_;
 	std::string ticket_;
 	terminal_callback on_terminal_;
+	stream_input_registry stream_inputs_;
 
 	// Destruction is reverse declaration order: execution (and its resolution
 	// tokens) is destroyed before the connection used by token cleanup.
@@ -539,6 +580,9 @@ public:
 		std::shared_ptr<execution_entry> result;
 		{
 			std::lock_guard lock(mutex_);
+			if (stopped_) {
+				return nullptr;
+			}
 			const auto found = entries_.find(ticket);
 			if (found == entries_.end()) {
 				return nullptr;
@@ -546,6 +590,15 @@ public:
 			result = found->second;
 		}
 		return result->claim() ? result : nullptr;
+	}
+
+	std::shared_ptr<execution_entry> lookup(const std::string &ticket) {
+		std::lock_guard lock(mutex_);
+		if (stopped_) {
+			return nullptr;
+		}
+		const auto found = entries_.find(ticket);
+		return found == entries_.end() ? nullptr : found->second;
 	}
 
 	enum class cancel_result : std::uint8_t { NOT_FOUND = 0, QUIESCED, DEADLINE_EXCEEDED };
@@ -603,14 +656,13 @@ public:
 		return entry->cancel_and_join(false, stop_waiting) ? cancel_result::QUIESCED : cancel_result::DEADLINE_EXCEEDED;
 	}
 
-	void shutdown() noexcept {
+	void stop_admission_and_cancel() noexcept {
 		std::vector<std::shared_ptr<execution_entry>> entries;
 		{
 			std::lock_guard lock(mutex_);
-			if (stopped_) {
-				return;
+			if (!stopped_) {
+				stopped_ = true;
 			}
-			stopped_ = true;
 			for (const auto &[_, entry] : entries_) {
 				entries.push_back(entry);
 			}
@@ -622,6 +674,17 @@ public:
 		}
 		for (const auto &entry : entries) {
 			entry->cancel(false);
+		}
+	}
+
+	void shutdown() noexcept {
+		stop_admission_and_cancel();
+		std::vector<std::shared_ptr<execution_entry>> entries;
+		{
+			std::lock_guard lock(mutex_);
+			for (const auto &[_, entry] : entries_) {
+				entries.push_back(entry);
+			}
 		}
 		for (const auto &entry : entries) {
 			entry->join();
@@ -696,6 +759,23 @@ private:
 	std::thread reaper_;
 };
 
+class input_handler_guard final {
+public:
+	input_handler_guard(std::shared_ptr<execution_entry> entry, std::shared_ptr<stream_input> input)
+	    : entry_(std::move(entry)), input_(std::move(input)) {
+	}
+	~input_handler_guard() {
+		entry_->detach_input(input_);
+	}
+
+	input_handler_guard(const input_handler_guard &) = delete;
+	input_handler_guard &operator=(const input_handler_guard &) = delete;
+
+private:
+	std::shared_ptr<execution_entry> entry_;
+	std::shared_ptr<stream_input> input_;
+};
+
 class sidecar_flight_server final : public flight::FlightServerBase {
 public:
 	sidecar_flight_server(duckdb::DatabaseInstance &database, const runtime_config &config)
@@ -704,6 +784,9 @@ public:
 
 	void stop_registry() noexcept {
 		registry_.shutdown();
+	}
+	void stop_admission() noexcept {
+		registry_.stop_admission_and_cancel();
 	}
 
 	arrow::Status GetFlightInfo(const flight::ServerCallContext &context, const flight::FlightDescriptor &descriptor,
@@ -730,6 +813,10 @@ public:
 			}
 			if (request.max_batch_bytes == 0 || request.max_batch_bytes > config_.max_batch_bytes) {
 				return arrow::Status::Invalid("max_batch_bytes exceeds the sidecar limit");
+			}
+			if (request.max_input_batch_bytes == 0 || request.max_input_batch_bytes > k_max_stream_input_batch_bytes ||
+			    request.max_input_batch_bytes > config_.max_batch_bytes) {
+				return arrow::Status::Invalid("max_input_batch_bytes exceeds the sidecar limit");
 			}
 			if (request.deadline_unix_ms <= now) {
 				return flight_error(flight::FlightStatusCode::TimedOut, "execution deadline already expired");
@@ -787,6 +874,89 @@ public:
 		return arrow::Status::OK();
 	}
 
+	arrow::Status DoPut(const flight::ServerCallContext &context, std::unique_ptr<flight::FlightMessageReader> reader,
+	                    std::unique_ptr<flight::FlightMetadataWriter> writer) override {
+		std::shared_ptr<execution_entry> entry;
+		try {
+			if (!reader || !writer || reader->descriptor().type != flight::FlightDescriptor::CMD) {
+				return arrow::Status::Invalid("UploadInput requires a command descriptor");
+			}
+			const auto request = parse_upload_input_request(reader->descriptor().cmd);
+			entry = registry_.lookup(request.ticket);
+			if (!entry) {
+				return arrow::Status::KeyError("unknown or expired sidecar execution ticket");
+			}
+			auto attached = entry->attach_input(request.stream_ref);
+			if (!attached.ok()) {
+				return attached.status();
+			}
+			auto input = std::move(attached).ValueOrDie();
+			input_handler_guard guard(entry, input);
+			const auto stopped = [&] {
+				return context.is_cancelled();
+			};
+			auto attached_ack = arrow::Buffer::FromString(serialize_upload_input_ack(upload_input_ack {.ready = true}));
+			const auto attached_status = writer->WriteMetadata(*attached_ack);
+			if (!attached_status.ok()) {
+				entry->fail_input(attached_status.ToString());
+				return attached_status;
+			}
+
+			while (true) {
+				auto next = reader->Next();
+				if (!next.ok()) {
+					entry->fail_input(next.status().ToString());
+					return next.status();
+				}
+				auto chunk = std::move(next).ValueOrDie();
+				if (!chunk.data && !chunk.app_metadata) {
+					auto completed = input->finish_upload(stopped);
+					if (!completed.ok()) {
+						entry->fail_input(completed.status().ToString());
+						return completed.status();
+					}
+					auto ack = arrow::Buffer::FromString(serialize_upload_input_ack(*completed));
+					return writer->WriteMetadata(*ack);
+				}
+				if (chunk.data || !chunk.app_metadata) {
+					entry->fail_input("UploadInput accepts MO-native metadata frames only");
+					return arrow::Status::Invalid("UploadInput accepts MO-native metadata frames only");
+				}
+				if (static_cast<std::uint64_t>(chunk.app_metadata->size()) >
+				    entry->max_input_batch_bytes() + k_native_batch_frame_header_bytes) {
+					entry->fail_input("MO native input frame exceeds the negotiated limit");
+					return arrow::Status::Invalid("MO native input frame exceeds the negotiated limit");
+				}
+				auto consumed = input->publish(std::move(chunk.app_metadata), stopped);
+				if (!consumed.ok()) {
+					entry->fail_input(consumed.status().ToString());
+					return consumed.status();
+				}
+				auto ack_value = *consumed;
+				auto ack = arrow::Buffer::FromString(serialize_upload_input_ack(ack_value));
+				const auto status = writer->WriteMetadata(*ack);
+				if (!status.ok()) {
+					entry->fail_input(status.ToString());
+					return status;
+				}
+				if (ack_value.complete) {
+					return arrow::Status::OK();
+				}
+			}
+		} catch (const std::invalid_argument &error) {
+			if (entry) {
+				entry->fail_input(error.what());
+			}
+			return arrow::Status::Invalid(error.what());
+		} catch (const std::exception &error) {
+			if (entry) {
+				entry->fail_input(error.what());
+			}
+			return flight_error(flight::FlightStatusCode::Internal,
+			                    std::string("native input upload failed: ") + error.what());
+		}
+	}
+
 	arrow::Status ListActions(const flight::ServerCallContext &, std::vector<flight::ActionType> *actions) override {
 		actions->emplace_back("GetCapabilities", "Return the canonical sidecar capability document");
 		actions->emplace_back("CancelExecution", "Cancel by opaque Flight ticket or request idempotency key");
@@ -812,7 +982,9 @@ public:
 			} catch (const std::invalid_argument &error) {
 				return arrow::Status::Invalid(error.what());
 			}
-			const auto stop_waiting = [&context] { return context.is_cancelled(); };
+			const auto stop_waiting = [&context] {
+				return context.is_cancelled();
+			};
 			const auto cancelled = request.ticket.empty()
 			                           ? registry_.cancel_and_join_idempotency(request.idempotency_key, stop_waiting)
 			                           : registry_.cancel_and_join(request.ticket, stop_waiting);
@@ -845,6 +1017,7 @@ public:
 	runtime_config config;
 	sidecar_flight_server server;
 	std::thread server_thread;
+	std::mutex stop_mutex;
 	std::atomic<bool> started {false};
 };
 
@@ -872,6 +1045,13 @@ void flight_runtime::start() {
 	    {read_secret_file(impl_->config.flight_cert_path), read_secret_file(impl_->config.flight_key_path)});
 	options.verify_client = true;
 	options.root_certificates = read_secret_file(impl_->config.flight_client_ca_path);
+	const auto maximum_receive = static_cast<int>(k_max_plan_bytes + 1024U * 1024U);
+	const auto maximum_send = static_cast<int>(impl_->config.max_batch_bytes + 1024U * 1024U);
+	options.builder_hook = [maximum_receive, maximum_send](void *raw_builder) {
+		auto *builder = static_cast<grpc::ServerBuilder *>(raw_builder);
+		builder->SetMaxReceiveMessageSize(maximum_receive);
+		builder->SetMaxSendMessageSize(maximum_send);
+	};
 	const auto initialized = impl_->server.Init(options);
 	if (!initialized.ok()) {
 		throw std::runtime_error(initialized.ToString());
@@ -888,8 +1068,11 @@ void flight_runtime::stop() noexcept {
 	if (!impl_) {
 		return;
 	}
+	std::lock_guard stop_lock(impl_->stop_mutex);
 	if (impl_->started.exchange(false)) {
-		const auto status = impl_->server.Shutdown();
+		impl_->server.stop_admission();
+		const auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(1);
+		const auto status = impl_->server.Shutdown(&deadline);
 		(void)status;
 	}
 	if (impl_->server_thread.joinable()) {

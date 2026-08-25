@@ -16,6 +16,24 @@ message ExecuteSubstraitRequest {
   bytes query_id = 7;
   bytes idempotency_key = 8;
   optional uint64 account_id = 9;
+  uint64 max_input_batch_bytes = 10;
+}
+
+// FlightDescriptor.cmd on a DoPut stream. The ticket identifies one prepared
+// execution and stream_ref selects one StreamRead leaf in its retained plan.
+message UploadInputRequest {
+  bytes ticket = 1;
+  bytes stream_ref = 2;
+}
+
+// Cumulative acknowledgement returned in PutResult.app_metadata.
+message UploadInputAck {
+  uint64 acknowledged_batches = 1;
+  uint64 rows = 2;
+  uint64 bytes = 3;
+  bool complete = 4;
+  bool not_needed = 5;
+  bool ready = 6;
 }
 
 // Flight Action.body for CancelExecution. Exactly one identity is required.

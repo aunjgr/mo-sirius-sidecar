@@ -4,6 +4,7 @@
 #include "mo_sidecar/tae_read_resolver.hpp"
 
 #include "mo_sidecar/protocol.hpp"
+#include "offload/stream_read.hpp"
 #include "offload/substrait_execution.hpp"
 #include "offload/tae_read.hpp"
 
@@ -11,8 +12,8 @@
 
 #include <openssl/rand.h>
 
-#include <cerrno>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
@@ -24,7 +25,9 @@
 namespace matrixone::sidecar {
 namespace {
 
+using sirius::offload::resolved_stream_read;
 using sirius::offload::resolved_tae_read;
+using sirius::offload::stream_read;
 using sirius::offload::substrait_error_code;
 using sirius::offload::substrait_execution_error;
 using sirius::offload::tae_read;
@@ -89,23 +92,23 @@ private:
 	std::string path_;
 };
 
-std::string random_relation_name() {
+std::string random_relation_name(std::string_view prefix) {
 	std::array<unsigned char, 16> random {};
 	if (RAND_bytes(random.data(), random.size()) != 1) {
 		resolution_failed("cannot generate a query-local relation name");
 	}
-	return "__mo_tae_" + hex(std::string_view(reinterpret_cast<const char *>(random.data()), random.size()));
+	return std::string(prefix) + hex(std::string_view(reinterpret_cast<const char *>(random.data()), random.size()));
 }
 
-class resolved_read final : public resolved_tae_read {
+class resolved_tae_relation final : public resolved_tae_read {
 public:
-	resolved_read(duckdb::Connection &connection, std::string relation_name, std::string manifest_path,
-	              tae_read request, ::substrait::NamedStruct canonical_schema)
+	resolved_tae_relation(duckdb::Connection &connection, std::string relation_name, std::string manifest_path,
+	                      tae_read request, ::substrait::NamedStruct canonical_schema)
 	    : connection_(connection), relation_name_(std::move(relation_name)), manifest_path_(std::move(manifest_path)),
 	      request_(std::move(request)), canonical_schema_(std::move(canonical_schema)) {
 	}
 
-	~resolved_read() noexcept override {
+	~resolved_tae_relation() noexcept override {
 		try {
 			// relation_name_ is generated from a fixed prefix and lowercase hex.
 			auto result = connection_.Query("DROP VIEW IF EXISTS \"" + relation_name_ + "\"");
@@ -162,6 +165,59 @@ private:
 	::substrait::NamedStruct canonical_schema_;
 };
 
+class resolved_stream_relation final : public resolved_stream_read {
+public:
+	resolved_stream_relation(duckdb::Connection &connection, std::string relation_name,
+	                         std::shared_ptr<stream_input> input, stream_read request,
+	                         ::substrait::NamedStruct canonical_schema)
+	    : connection_(connection), relation_name_(std::move(relation_name)), input_(std::move(input)),
+	      request_(std::move(request)), canonical_schema_(std::move(canonical_schema)) {
+	}
+
+	~resolved_stream_relation() noexcept override {
+		try {
+			auto result = connection_.Query("DROP VIEW IF EXISTS \"" + relation_name_ + "\"");
+			(void)result;
+		} catch (...) {
+		}
+	}
+
+	const std::string &relation_name() const noexcept override {
+		return relation_name_;
+	}
+	const ::substrait::NamedStruct &canonical_schema() const noexcept override {
+		return canonical_schema_;
+	}
+	const std::string &stream_ref() const noexcept override {
+		return request_.stream_ref;
+	}
+	const std::string &query_id() const noexcept override {
+		return request_.query_id;
+	}
+	std::uint64_t account_id() const noexcept override {
+		return request_.account_id;
+	}
+	const std::string &snapshot_ts() const noexcept override {
+		return request_.snapshot_ts;
+	}
+	const std::string &schema_digest() const noexcept override {
+		return request_.schema_digest;
+	}
+	const std::string &capability_hash() const noexcept override {
+		return request_.capability_hash;
+	}
+	std::uint64_t expires_at_unix_ms() const noexcept override {
+		return request_.expires_at_unix_ms;
+	}
+
+private:
+	duckdb::Connection &connection_;
+	std::string relation_name_;
+	std::shared_ptr<stream_input> input_;
+	stream_read request_;
+	::substrait::NamedStruct canonical_schema_;
+};
+
 std::string call_read_service(const runtime_config &config, const std::string &request) {
 	constexpr std::size_t max_response_bytes = 64U * 1024U * 1024U;
 	duckdb_httplib_openssl::SSLClient client(config.read_endpoint.host, config.read_endpoint.port,
@@ -211,8 +267,10 @@ std::string call_read_service(const runtime_config &config, const std::string &r
 } // namespace
 
 matrixone_tae_read_resolver::matrixone_tae_read_resolver(duckdb::Connection &connection, const runtime_config &config,
-                                                         std::string query_id, std::uint64_t account_id)
-    : connection_(connection), config_(config), query_id_(std::move(query_id)), account_id_(account_id) {
+                                                         std::string query_id, std::uint64_t account_id,
+                                                         stream_input_registry &stream_inputs)
+    : connection_(connection), config_(config), query_id_(std::move(query_id)), account_id_(account_id),
+      stream_inputs_(stream_inputs) {
 }
 
 std::unique_ptr<resolved_tae_read>
@@ -259,15 +317,44 @@ matrixone_tae_read_resolver::resolve(const tae_read &request, const ::substrait:
 	}
 
 	temporary_manifest manifest(response.manifest);
-	const auto relation_name = random_relation_name();
+	const auto relation_name = random_relation_name("__mo_tae_");
 	try {
 		connection_.TableFunction("tae_scan", {duckdb::Value(manifest.path())})->CreateView(relation_name, true, true);
 	} catch (const std::exception &error) {
 		resolution_failed(std::string("cannot bind the authenticated TAE manifest: ") + error.what());
 	}
 
-	return std::make_unique<resolved_read>(connection_, relation_name, manifest.release(), request,
-	                                       std::move(canonical_schema));
+	return std::make_unique<resolved_tae_relation>(connection_, relation_name, manifest.release(), request,
+	                                               std::move(canonical_schema));
+}
+
+std::unique_ptr<resolved_stream_read>
+matrixone_tae_read_resolver::resolve(const stream_read &request, const ::substrait::NamedStruct &requested_schema) {
+	if (request.query_id != query_id_ || request.account_id != account_id_) {
+		authentication_failed("StreamRead identity does not match the Flight execution");
+	}
+	if (request.capability_hash != capability_hash()) {
+		authentication_failed("StreamRead capability hash does not match this sidecar");
+	}
+	std::string requested_schema_bytes;
+	if (!requested_schema.SerializeToString(&requested_schema_bytes)) {
+		resolution_failed("cannot serialize the requested stream schema");
+	}
+	if (sha256_bytes(requested_schema_bytes) != request.schema_digest) {
+		authentication_failed("StreamRead schema digest does not match the requested schema");
+	}
+
+	auto input = stream_inputs_.create(request, requested_schema);
+	const auto relation_name = random_relation_name("__mo_stream_");
+	try {
+		connection_.TableFunction("mo_stream_scan", {duckdb::Value::POINTER(reinterpret_cast<uintptr_t>(input.get()))})
+		    ->CreateView(relation_name, true, true);
+	} catch (const std::exception &error) {
+		input->cancel("StreamRead relation binding failed");
+		resolution_failed(std::string("cannot bind the authenticated StreamRead: ") + error.what());
+	}
+	return std::make_unique<resolved_stream_relation>(connection_, relation_name, std::move(input), request,
+	                                                  requested_schema);
 }
 
 } // namespace matrixone::sidecar
