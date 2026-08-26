@@ -3,9 +3,13 @@
 
 #include "catch.hpp"
 
+#include "mo_sidecar/native_result.hpp"
 #include "mo_sidecar/stream_input.hpp"
 
 #include <arrow/buffer.h>
+#include <arrow/flight/server.h>
+#include <arrow/ipc/dictionary.h>
+#include <arrow/ipc/writer.h>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/parser/parsed_data/create_table_function_info.hpp>
@@ -49,10 +53,10 @@ sirius::offload::stream_read stream_request() {
 }
 
 std::string vector_bytes(tae::MOTypeOid oid, std::int32_t size, std::int32_t width, std::int32_t scale,
-                         std::uint32_t rows, std::string data, std::string area = {}, std::string nulls = {}) {
+						 std::uint32_t rows, std::string data, std::string area = {}, std::string nulls = {}) {
 	std::string result;
 	result.push_back(0);
-	tae::MOType type {};
+	tae::MOType type{};
 	type.oid = oid;
 	type.size = size;
 	type.width = width;
@@ -70,7 +74,7 @@ std::string vector_bytes(tae::MOTypeOid oid, std::int32_t size, std::int32_t wid
 }
 
 std::shared_ptr<arrow::Buffer> native_frame(std::uint64_t sequence, std::uint64_t rows,
-                                            const std::vector<std::string> &vectors) {
+											const std::vector<std::string> &vectors) {
 	std::string batch;
 	u64(batch, rows);
 	u32(batch, static_cast<std::uint32_t>(vectors.size()));
@@ -119,11 +123,11 @@ std::shared_ptr<arrow::Buffer> i64_frame(std::uint64_t sequence, std::int64_t fi
 
 std::shared_ptr<arrow::Buffer> tpch_frame() {
 	std::string strings;
-	tae::Varlena inline_value {};
+	tae::Varlena inline_value{};
 	inline_value.data[0] = 5;
 	std::memcpy(inline_value.data + 1, "hello", 5);
 	strings.append(reinterpret_cast<const char *>(&inline_value), sizeof(inline_value));
-	tae::Varlena big_value {};
+	tae::Varlena big_value{};
 	const std::uint32_t marker = tae::VARLENA_BIG_MARKER;
 	const std::uint32_t offset = 0;
 	const std::string area = "this value is deliberately longer than twenty three bytes";
@@ -141,7 +145,7 @@ std::shared_ptr<arrow::Buffer> tpch_frame() {
 
 	std::string decimal64;
 	u64(decimal64, 1234);
-	u64(decimal64, static_cast<std::uint64_t>(std::int64_t {-567}));
+	u64(decimal64, static_cast<std::uint64_t>(std::int64_t{-567}));
 	u64(decimal64, 0);
 	std::string decimal128;
 	for (const std::uint64_t value : {123456U, 1U, 0U}) {
@@ -150,14 +154,14 @@ std::shared_ptr<arrow::Buffer> tpch_frame() {
 	}
 	std::string dates;
 	for (const std::int32_t value :
-	     {tae::MO_UNIX_EPOCH_DAYS, tae::MO_UNIX_EPOCH_DAYS + 1, tae::MO_UNIX_EPOCH_DAYS - 1}) {
+		 {tae::MO_UNIX_EPOCH_DAYS, tae::MO_UNIX_EPOCH_DAYS + 1, tae::MO_UNIX_EPOCH_DAYS - 1}) {
 		u32(dates, static_cast<std::uint32_t>(value));
 	}
 	return native_frame(1, 3,
-	                    {vector_bytes(tae::MO_T_varchar, -24, 0, 0, 3, std::move(strings), area, std::move(nulls)),
-	                     vector_bytes(tae::MO_T_decimal64, 8, 18, 2, 3, std::move(decimal64)),
-	                     vector_bytes(tae::MO_T_decimal128, 16, 38, 4, 3, std::move(decimal128)),
-	                     vector_bytes(tae::MO_T_date, 4, 0, 0, 3, std::move(dates))});
+						{vector_bytes(tae::MO_T_varchar, -24, 0, 0, 3, std::move(strings), area, std::move(nulls)),
+						 vector_bytes(tae::MO_T_decimal64, 8, 18, 2, 3, std::move(decimal64)),
+						 vector_bytes(tae::MO_T_decimal128, 16, 38, 4, 3, std::move(decimal128)),
+						 vector_bytes(tae::MO_T_date, 4, 0, 0, 3, std::move(dates))});
 }
 
 } // namespace
@@ -180,14 +184,14 @@ TEST_CASE("MO native batch decoder validates and exposes borrowed vectors", "[si
 
 	auto malformed = arrow::Buffer::FromString(std::string("MOB1", 4));
 	REQUIRE_THROWS(matrixone::sidecar::native_batch_view(
-	    malformed, matrixone::sidecar::native_batch_frame {1, std::string_view("bad")}, i64_schema()));
+		malformed, matrixone::sidecar::native_batch_frame{1, std::string_view("bad")}, i64_schema()));
 }
 
 TEST_CASE("MO native input acknowledges only after complete consumption", "[sidecar][stream]") {
 	auto input = std::make_shared<matrixone::sidecar::stream_input>(stream_request(), i64_schema());
 	REQUIRE(input->attach().ok());
 	auto published =
-	    std::async(std::launch::async, [&] { return input->publish(i64_frame(1, 10, 20), [] { return false; }); });
+		std::async(std::launch::async, [&] { return input->publish(i64_frame(1, 10, 20), [] { return false; }); });
 	auto batch = input->next_batch();
 	REQUIRE(batch);
 	REQUIRE(published.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout);
@@ -210,7 +214,7 @@ TEST_CASE("MO native input cancellation releases a blocked publisher", "[sidecar
 	auto input = std::make_shared<matrixone::sidecar::stream_input>(stream_request(), i64_schema());
 	REQUIRE(input->attach().ok());
 	auto published =
-	    std::async(std::launch::async, [&] { return input->publish(i64_frame(1, 10, 20), [] { return false; }); });
+		std::async(std::launch::async, [&] { return input->publish(i64_frame(1, 10, 20), [] { return false; }); });
 	REQUIRE(input->next_batch());
 	input->cancel("injected cancellation");
 	auto result = published.get();
@@ -231,8 +235,8 @@ TEST_CASE("mo_stream_scan materializes TPCH MO native types", "[sidecar][stream]
 	REQUIRE(input->attach().ok());
 	auto query = std::async(std::launch::async, [&] {
 		return connection
-		    .TableFunction("mo_stream_scan", {duckdb::Value::POINTER(reinterpret_cast<std::uintptr_t>(input.get()))})
-		    ->Execute();
+			.TableFunction("mo_stream_scan", {duckdb::Value::POINTER(reinterpret_cast<std::uintptr_t>(input.get()))})
+			->Execute();
 	});
 	auto published = input->publish(tpch_frame(), [] { return false; });
 	REQUIRE(published.ok());
@@ -254,4 +258,76 @@ TEST_CASE("mo_stream_scan materializes TPCH MO native types", "[sidecar][stream]
 	REQUIRE(chunk->GetValue(2, 0).ToString() == "12.3456");
 	REQUIRE(chunk->GetValue(3, 0).ToString() == "1970-01-01");
 	REQUIRE(chunk->GetValue(3, 1).ToString() == "1970-01-02");
+}
+
+TEST_CASE("MO native result encoder round trips through the input codec", "[sidecar][stream][result]") {
+	duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,
+											  duckdb::LogicalType::DATE};
+	duckdb::DataChunk chunk;
+	chunk.Initialize(duckdb::Allocator::DefaultAllocator(), types);
+	chunk.SetValue(0, 0, duckdb::Value("short"));
+	chunk.SetValue(0, 1, duckdb::Value("this string is longer than the MatrixOne inline limit"));
+	chunk.SetValue(1, 0, duckdb::Value::BIGINT(-7));
+	chunk.SetValue(1, 1, duckdb::Value());
+	chunk.SetValue(2, 0, duckdb::Value::DATE(duckdb::date_t(0)));
+	chunk.SetValue(2, 1, duckdb::Value::DATE(duckdb::date_t(1)));
+	chunk.SetCardinality(2);
+
+	matrixone::sidecar::native_result_schema schema{matrixone::sidecar::k_native_result_schema_version,
+													{{"s", tae::MO_T_varchar, 100, 0, 0, false},
+													 {"i", tae::MO_T_int64, 0, 0, 0, false},
+													 {"d", tae::MO_T_date, 0, 0, 0, false}}};
+	sirius::offload::execution_schema actual{{"s", "i", "d"}, types};
+	REQUIRE_NOTHROW(matrixone::sidecar::validate_native_result_schema(schema, actual));
+
+	const auto payload = matrixone::sidecar::encode_native_result_batch(chunk, 0, 2, schema);
+	::substrait::NamedStruct input_schema;
+	input_schema.add_names("s");
+	input_schema.add_names("i");
+	input_schema.add_names("d");
+	input_schema.mutable_struct_()->add_types()->mutable_string();
+	input_schema.mutable_struct_()->add_types()->mutable_i64();
+	input_schema.mutable_struct_()->add_types()->mutable_date();
+	const auto frame_bytes = matrixone::sidecar::serialize_native_batch_frame(1, payload);
+	auto frame = arrow::Buffer::FromString(frame_bytes);
+	auto envelope = matrixone::sidecar::parse_native_batch_frame(frame_bytes);
+	matrixone::sidecar::native_batch_view decoded(frame, envelope, input_schema);
+	REQUIRE(decoded.rows() == 2);
+	REQUIRE(decoded.columns().size() == 3);
+	REQUIRE(decoded.columns()[0].type.oid == tae::MO_T_varchar);
+	REQUIRE(decoded.columns()[0].area == "this string is longer than the MatrixOne inline limit");
+	REQUIRE(decoded.columns()[1].is_null(1));
+	std::int32_t first_date = 0;
+	std::memcpy(&first_date, decoded.columns()[2].data.data(), sizeof(first_date));
+	REQUIRE(first_date == tae::MO_UNIX_EPOCH_DAYS);
+}
+
+TEST_CASE("Flight accepts native data-header payloads", "[sidecar][stream][result]") {
+	arrow::flight::FlightPayload schema_payload;
+	auto schema = arrow::schema({});
+	arrow::ipc::DictionaryFieldMapper mapper(*schema);
+	REQUIRE(arrow::ipc::GetSchemaPayload(*schema, arrow::ipc::IpcWriteOptions::Defaults(), mapper,
+										 &schema_payload.ipc_message)
+				.ok());
+	REQUIRE(schema_payload.Validate().ok());
+	auto frame = matrixone::sidecar::serialize_native_batch_frame(1, "batch");
+	arrow::flight::FlightPayload batch_payload;
+	batch_payload.ipc_message.type = arrow::ipc::MessageType::RECORD_BATCH;
+	batch_payload.ipc_message.metadata = arrow::Buffer::FromString(frame);
+	REQUIRE(batch_payload.Validate().ok());
+}
+
+TEST_CASE("MO native result schema accepts bounded TPCH coercions", "[sidecar][stream][result]") {
+	matrixone::sidecar::native_result_schema schema{matrixone::sidecar::k_native_result_schema_version,
+													{{"avg_decimal", tae::MO_T_decimal128, 38, 8, 0, false},
+													 {"sum_integer", tae::MO_T_decimal128, 38, 0, 0, false}}};
+	sirius::offload::execution_schema actual{{"avg_decimal", "sum_integer"},
+											 {duckdb::LogicalType::DOUBLE, duckdb::LogicalType::HUGEINT}};
+	REQUIRE_NOTHROW(matrixone::sidecar::validate_native_result_schema(schema, actual));
+
+	actual.types[1] = duckdb::LogicalType::DOUBLE;
+	schema.columns[1].scale = 1;
+	REQUIRE_NOTHROW(matrixone::sidecar::validate_native_result_schema(schema, actual));
+	actual.types[1] = duckdb::LogicalType::HUGEINT;
+	REQUIRE_THROWS(matrixone::sidecar::validate_native_result_schema(schema, actual));
 }

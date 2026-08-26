@@ -54,7 +54,7 @@ See [DESIGN.md §13](DESIGN.md#13-gpu-native-tae-scan-sirius) for full architect
 | **httpserver** | [duckdb-httpserver](https://github.com/matrixorigin/duckdb-httpserver) | DuckDB HTTP server for accepting SQL queries |
 | **substrait** | [duckdb-substrait](https://github.com/matrixorigin/duckdb-substrait) | Imports and exports Substrait query plans (GPU build only) |
 | **sirius** | [sirius](https://github.com/matrixorigin/sirius) | GPU-accelerated SQL execution via cuCascade/cuDF |
-| **mo-sidecar** | this repository | mTLS Flight server, strict execution envelope, authenticated `TaeRead` resolution, bounded Arrow streaming |
+| **mo-sidecar** | this repository | mTLS Flight server, strict execution envelope, authenticated `TaeRead` resolution, bounded MO-native batch streaming |
 
 Extensions are statically linked into the DuckDB binary — no manual `LOAD` needed.
 The GPU build adds Substrait and Sirius on top of the base extensions.
@@ -204,6 +204,7 @@ is bound:
 | `MO_SIDECAR_READ_CLIENT_CERT`, `MO_SIDECAR_READ_CLIENT_KEY` | Sidecar workload identity PEM paths |
 | `MO_SIDECAR_MAX_ACTIVE_TICKETS` | Pending + running execution bound (default 128) |
 | `MO_SIDECAR_MAX_BATCH_BYTES` | Per-batch hard bound (default 64 MiB) |
+| `MO_SIDECAR_GPU_RESULT_PACK_MIN_BYTES` | GPU-native fixed-width result-pack threshold (default 1 MiB; clamped to 64 KiB–64 MiB) |
 | `MO_SIDECAR_TICKET_TTL_MS` | Maximum unclaimed/running ticket lifetime (default 15 min; maximum 20 min) |
 
 The wire schema and server behavior are documented in
@@ -262,7 +263,7 @@ Choose the image profile before starting it:
 | Profile | Select it with | MatrixOne transport | Host ports | Intended use |
 |---|---|---|---|---|
 | Legacy HTTP | default | rewritten SQL over `http://127.0.0.1:9999` | `6001`, `8888`, optionally `9999` | compatibility and side-by-side benchmarks |
-| Flight/Substrait | `MO_SIRIUS_FLIGHT=1` | logical Substrait plan and Arrow batches over local mTLS Flight | `6001`, `8888`; never publish Flight | one local CN and its paired GPU sidecar |
+| Flight/Substrait | `MO_SIRIUS_FLIGHT=1` | logical Substrait plan and MO-native batches over local mTLS Flight | `6001`, `8888`; never publish Flight | one local CN and its paired GPU sidecar |
 
 The two profiles are mutually exclusive. The Flight profile does not use
 `cn.frontend.sidecarUrl`, does not accept a remote sidecar, and must not be

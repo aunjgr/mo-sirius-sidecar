@@ -17,6 +17,25 @@ message ExecuteSubstraitRequest {
   bytes idempotency_key = 8;
   optional uint64 account_id = 9;
   uint64 max_input_batch_bytes = 10;
+  bytes result_schema = 11; // NativeResultSchema wire value echoed in FlightInfo.schema.
+}
+
+// Exact MatrixOne physical result schema. DoGet sends application-metadata-only
+// FlightData messages whose app_metadata is an MOB1-framed batch.MarshalBinary
+// payload. Flight emits one empty Arrow transport schema; every later
+// FlightData.data_header is the MOB1 frame itself.
+message NativeResultSchema {
+  uint32 version = 1;
+  repeated NativeResultColumn columns = 2;
+}
+
+message NativeResultColumn {
+  string name = 1;
+  uint32 oid = 2;
+  int32 width = 3;
+  int32 scale = 4;
+  uint32 charset = 5;
+  bool not_nullable = 6;
 }
 
 // FlightDescriptor.cmd on a DoPut stream. The ticket identifies one prepared

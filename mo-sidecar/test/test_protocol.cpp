@@ -28,6 +28,17 @@ void bytes(std::string &output, unsigned field, std::string_view value) {
 	output.append(value);
 }
 
+std::string native_result_schema() {
+	std::string column;
+	bytes(column, 1, "value");
+	integer(column, 2, 23); // MO_T_int64
+	integer(column, 3, static_cast<std::uint64_t>(static_cast<std::int64_t>(-1)));
+	std::string schema;
+	integer(schema, 1, matrixone::sidecar::k_native_result_schema_version);
+	bytes(schema, 2, column);
+	return schema;
+}
+
 std::string valid_execute_request(std::uint64_t account_id = 42, bool include_account = true) {
 	const auto query_id = std::string(16, 'q');
 	const auto plan = std::string("plan");
@@ -44,6 +55,7 @@ std::string valid_execute_request(std::uint64_t account_id = 42, bool include_ac
 		integer(result, 9, account_id);
 	}
 	integer(result, 10, matrixone::sidecar::k_max_stream_input_batch_bytes);
+	bytes(result, 11, native_result_schema());
 	return result;
 }
 
@@ -61,8 +73,15 @@ TEST_CASE("ExecuteSubstrait envelope parses strictly", "[sidecar][protocol]") {
 	REQUIRE(parsed.idempotency_key == matrixone::sidecar::execution_idempotency_key(42, std::string(16, 'q')));
 	REQUIRE(parsed.account_id == 42);
 	REQUIRE(parsed.max_input_batch_bytes == matrixone::sidecar::k_max_stream_input_batch_bytes);
+	REQUIRE(parsed.result_schema == native_result_schema());
+	const auto result_schema = matrixone::sidecar::parse_native_result_schema(parsed.result_schema);
+	REQUIRE(result_schema.version == matrixone::sidecar::k_native_result_schema_version);
+	REQUIRE(result_schema.columns.size() == 1);
+	REQUIRE(result_schema.columns[0].name == "value");
+	REQUIRE(result_schema.columns[0].oid == 23);
+	REQUIRE(result_schema.columns[0].width == -1);
 	REQUIRE(matrixone::sidecar::hex(parsed.idempotency_key) ==
-	        "77f6a676cc4bfdbc9265e1bbbcd8140f4a820ec41a2979f52706f41ff22fb33a");
+			"77f6a676cc4bfdbc9265e1bbbcd8140f4a820ec41a2979f52706f41ff22fb33a");
 }
 
 TEST_CASE("ExecuteSubstrait distinguishes the system account from a missing identity", "[sidecar][protocol]") {
@@ -74,14 +93,14 @@ TEST_CASE("ExecuteSubstrait distinguishes the system account from a missing iden
 }
 
 TEST_CASE("ExecuteSubstrait rejects duplicates, unknowns, truncation, and "
-          "wrong wire types",
-          "[sidecar][protocol]") {
+		  "wrong wire types",
+		  "[sidecar][protocol]") {
 	auto duplicate = valid_execute_request();
 	integer(duplicate, 1, 1);
 	REQUIRE_THROWS(matrixone::sidecar::parse_execute_request(duplicate));
 
 	auto unknown = valid_execute_request();
-	integer(unknown, 11, 1);
+	integer(unknown, 12, 1);
 	REQUIRE_THROWS(matrixone::sidecar::parse_execute_request(unknown));
 
 	auto truncated = valid_execute_request();
@@ -91,6 +110,31 @@ TEST_CASE("ExecuteSubstrait rejects duplicates, unknowns, truncation, and "
 	std::string wrong_wire;
 	bytes(wrong_wire, 1, "1");
 	REQUIRE_THROWS(matrixone::sidecar::parse_execute_request(wrong_wire));
+}
+
+TEST_CASE("MO native result schema rejects ambiguous protobufs", "[sidecar][protocol]") {
+	auto schema = native_result_schema();
+	auto parsed = matrixone::sidecar::parse_native_result_schema(schema);
+	REQUIRE(parsed.columns.size() == 1);
+
+	auto duplicate_version = schema;
+	integer(duplicate_version, 1, matrixone::sidecar::k_native_result_schema_version);
+	REQUIRE_THROWS(matrixone::sidecar::parse_native_result_schema(duplicate_version));
+
+	std::string missing_oid_column;
+	bytes(missing_oid_column, 1, "value");
+	std::string missing_oid;
+	integer(missing_oid, 1, matrixone::sidecar::k_native_result_schema_version);
+	bytes(missing_oid, 2, missing_oid_column);
+	REQUIRE_THROWS(matrixone::sidecar::parse_native_result_schema(missing_oid));
+
+	std::string duplicate_oid_column;
+	integer(duplicate_oid_column, 2, 23);
+	integer(duplicate_oid_column, 2, 23);
+	std::string duplicate_oid;
+	integer(duplicate_oid, 1, matrixone::sidecar::k_native_result_schema_version);
+	bytes(duplicate_oid, 2, duplicate_oid_column);
+	REQUIRE_THROWS(matrixone::sidecar::parse_native_result_schema(duplicate_oid));
 }
 
 TEST_CASE("UploadInput and MO native frames parse strictly", "[sidecar][protocol]") {
@@ -110,10 +154,10 @@ TEST_CASE("UploadInput and MO native frames parse strictly", "[sidecar][protocol
 	frame.push_back(0);
 	frame.push_back(0);
 	for (unsigned i = 0; i < 8; ++i) {
-		frame.push_back(static_cast<char>((std::uint64_t {7} >> (i * 8U)) & 0xffU));
+		frame.push_back(static_cast<char>((std::uint64_t{7} >> (i * 8U)) & 0xffU));
 	}
 	for (unsigned i = 0; i < 8; ++i) {
-		frame.push_back(static_cast<char>((std::uint64_t {3} >> (i * 8U)) & 0xffU));
+		frame.push_back(static_cast<char>((std::uint64_t{3} >> (i * 8U)) & 0xffU));
 	}
 	frame.append("bat");
 	const auto parsed = matrixone::sidecar::parse_native_batch_frame(frame);
@@ -147,7 +191,7 @@ TEST_CASE("CancelExecution accepts exactly one opaque identity", "[sidecar][prot
 	std::string short_ticket;
 	bytes(short_ticket, 1, "short");
 	REQUIRE_THROWS(matrixone::sidecar::parse_cancel_request(short_ticket));
-	REQUIRE_THROWS(matrixone::sidecar::parse_cancel_request(std::string {}));
+	REQUIRE_THROWS(matrixone::sidecar::parse_cancel_request(std::string{}));
 }
 
 TEST_CASE("ResolveTaeRead response is strict and bounded", "[sidecar][protocol]") {
@@ -211,7 +255,7 @@ TEST_CASE("TaeRead serialization includes the database identity", "[sidecar][pro
 
 TEST_CASE("HTTPS endpoint parsing fails closed", "[sidecar][config]") {
 	auto endpoint =
-	    matrixone::sidecar::parse_https_endpoint("https://matrixone.internal:9443/internal/v1/sidecar/read/resolve");
+		matrixone::sidecar::parse_https_endpoint("https://matrixone.internal:9443/internal/v1/sidecar/read/resolve");
 	REQUIRE(endpoint.host == "matrixone.internal");
 	REQUIRE(endpoint.port == 9443);
 	REQUIRE(endpoint.path == "/internal/v1/sidecar/read/resolve");
@@ -227,7 +271,7 @@ TEST_CASE("HTTPS endpoint parsing fails closed", "[sidecar][config]") {
 TEST_CASE("Capability document has a stable SHA-256", "[sidecar][protocol]") {
 	REQUIRE(matrixone::sidecar::capability_hash().size() == 32);
 	REQUIRE(matrixone::sidecar::hex(matrixone::sidecar::capability_hash()) ==
-	        "cf5b91ce5ad2c29a952df10905d025ee143e0481f9eb2f28e6d129b81d673dc1");
+			"e72e3c64e9519fb2824c7773ea40564a2c76e7ec36e46560d7c6de7d1444fc11");
 	REQUIRE(matrixone::sidecar::sha256_bytes(matrixone::sidecar::capability_document()) ==
-	        matrixone::sidecar::capability_hash());
+			matrixone::sidecar::capability_hash());
 }

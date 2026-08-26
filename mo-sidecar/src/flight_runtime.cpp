@@ -3,6 +3,7 @@
 
 #include "mo_sidecar/flight_runtime.hpp"
 
+#include "mo_sidecar/native_result.hpp"
 #include "mo_sidecar/protocol.hpp"
 #include "mo_sidecar/stream_input.hpp"
 #include "mo_sidecar/tae_read_resolver.hpp"
@@ -10,14 +11,10 @@
 #include "execution/sirius_execution_evidence.hpp"
 #include "offload/substrait_execution.hpp"
 
-#include <arrow/array/data.h>
-#include <arrow/c/bridge.h>
 #include <arrow/flight/api.h>
 #include <arrow/flight/server.h>
+#include <arrow/ipc/dictionary.h>
 #include <arrow/ipc/writer.h>
-#include <arrow/memory_pool.h>
-#include <arrow/record_batch.h>
-#include <duckdb/common/arrow/arrow_converter.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
 #include <grpcpp/server_builder.h>
@@ -26,16 +23,14 @@
 
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <functional>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace matrixone::sidecar {
@@ -66,61 +61,6 @@ arrow::Status substrait_error(const sirius::offload::substrait_execution_error &
 	return flight_error(flight::FlightStatusCode::Internal, "unknown Sirius execution error");
 }
 
-std::shared_ptr<arrow::Schema> make_arrow_schema(duckdb::ClientContext &context,
-                                                 const sirius::offload::execution_schema &schema) {
-	ArrowSchema c_schema {};
-	auto properties = context.GetClientProperties();
-	duckdb::ArrowConverter::ToArrowSchema(&c_schema, schema.types, schema.names, properties);
-	auto imported = arrow::ImportSchema(&c_schema);
-	if (!imported.ok()) {
-		throw std::runtime_error(imported.status().ToString());
-	}
-	return std::move(imported).ValueOrDie();
-}
-
-void add_array_bytes(const std::shared_ptr<arrow::ArrayData> &data, std::unordered_set<const arrow::Buffer *> &seen,
-                     std::uint64_t &total) {
-	if (!data) {
-		return;
-	}
-	for (const auto &buffer : data->buffers) {
-		if (buffer && seen.emplace(buffer.get()).second) {
-			const auto size = static_cast<std::uint64_t>(buffer->size());
-			if (size > std::numeric_limits<std::uint64_t>::max() - total) {
-				throw std::overflow_error("Arrow batch size overflow");
-			}
-			total += size;
-		}
-	}
-	for (const auto &child : data->child_data) {
-		add_array_bytes(child, seen, total);
-	}
-	add_array_bytes(data->dictionary, seen, total);
-}
-
-std::uint64_t batch_bytes(const arrow::RecordBatch &batch) {
-	std::unordered_set<const arrow::Buffer *> seen;
-	std::uint64_t total = 0;
-	for (const auto &column : batch.column_data()) {
-		add_array_bytes(column, seen, total);
-	}
-	return total;
-}
-
-std::shared_ptr<arrow::RecordBatch> convert_chunk(const duckdb::DataChunk &chunk, duckdb::ClientContext &context,
-                                                  const std::shared_ptr<arrow::Schema> &schema) {
-	ArrowArray c_array {};
-	// ArrowConverter copies the chunk into Arrow-owned buffers. Its legacy API is
-	// non-const even though Append does not mutate the input chunk.
-	duckdb::ArrowConverter::ToArrowArray(const_cast<duckdb::DataChunk &>(chunk), &c_array,
-	                                     context.GetClientProperties(), {});
-	auto imported = arrow::ImportRecordBatch(&c_array, schema);
-	if (!imported.ok()) {
-		throw std::runtime_error(imported.status().ToString());
-	}
-	return std::move(imported).ValueOrDie();
-}
-
 std::string random_ticket() {
 	std::string value(32, '\0');
 	if (RAND_bytes(reinterpret_cast<unsigned char *>(value.data()), value.size()) != 1) {
@@ -132,22 +72,23 @@ std::string random_ticket() {
 class ticket_registry;
 
 class execution_entry final : public std::enable_shared_from_this<execution_entry> {
-public:
+  public:
 	using terminal_callback = std::function<void(const std::string &)>;
 
 	execution_entry(duckdb::DatabaseInstance &database, const runtime_config &config, execute_request request,
-	                std::string ticket, terminal_callback on_terminal)
-	    : config_(config), request_(std::move(request)), ticket_(std::move(ticket)),
-	      on_terminal_(std::move(on_terminal)), connection_(std::make_unique<duckdb::Connection>(database)),
-	      evidence_(std::make_shared<sirius::execution_evidence>(sirius::execution_backend::SIRIUS_GPU)) {
+					std::string ticket, terminal_callback on_terminal)
+		: config_(config), request_(std::move(request)), ticket_(std::move(ticket)),
+		  on_terminal_(std::move(on_terminal)), connection_(std::make_unique<duckdb::Connection>(database)),
+		  evidence_(std::make_shared<sirius::execution_evidence>(sirius::execution_backend::SIRIUS_GPU)) {
 		// Resolution creates query-local views that binding and execution must
 		// observe in one transaction. The entry owns the connection through
 		// quiescence; Connection rolls this read-only transaction back on destroy.
 		connection_->BeginTransaction();
 		matrixone_tae_read_resolver resolver(*connection_, config_, request_.query_id, request_.account_id,
-		                                     stream_inputs_);
+											 stream_inputs_);
 		execution_ = sirius::offload::prepare_substrait(*connection_->context, request_.plan, resolver, evidence_);
-		schema_ = make_arrow_schema(*connection_->context, execution_->schema());
+		schema_ = parse_native_result_schema(request_.result_schema);
+		validate_native_result_schema(schema_, execution_->schema());
 	}
 
 	~execution_entry() noexcept {
@@ -162,21 +103,11 @@ public:
 		}
 	}
 
-	const std::string &ticket() const noexcept {
-		return ticket_;
-	}
-	const std::shared_ptr<arrow::Schema> &schema() const noexcept {
-		return schema_;
-	}
-	std::uint64_t deadline_unix_ms() const noexcept {
-		return request_.deadline_unix_ms;
-	}
-	const std::string &idempotency_key() const noexcept {
-		return request_.idempotency_key;
-	}
-	std::uint64_t max_input_batch_bytes() const noexcept {
-		return request_.max_input_batch_bytes;
-	}
+	const std::string &ticket() const noexcept { return ticket_; }
+	const std::string &schema_wire() const noexcept { return request_.result_schema; }
+	std::uint64_t deadline_unix_ms() const noexcept { return request_.deadline_unix_ms; }
+	const std::string &idempotency_key() const noexcept { return request_.idempotency_key; }
+	std::uint64_t max_input_batch_bytes() const noexcept { return request_.max_input_batch_bytes; }
 
 	arrow::Result<std::shared_ptr<stream_input>> attach_input(const std::string &stream_ref) {
 		auto input = stream_inputs_.find(stream_ref);
@@ -226,10 +157,10 @@ public:
 		worker_ = std::thread([self = shared_from_this()] { self->run(); });
 	}
 
-	arrow::Status read_next(const flight::ServerCallContext &context, std::shared_ptr<arrow::RecordBatch> *output) {
+	arrow::Status read_next(const flight::ServerCallContext &context, std::shared_ptr<arrow::Buffer> *output) {
 		std::unique_lock lock(mutex_);
 		const auto deadline =
-		    std::chrono::system_clock::time_point(std::chrono::milliseconds(request_.deadline_unix_ms));
+			std::chrono::system_clock::time_point(std::chrono::milliseconds(request_.deadline_unix_ms));
 		while (true) {
 			lock.unlock();
 			const bool client_cancelled = context.is_cancelled();
@@ -239,7 +170,7 @@ public:
 				cancel(false);
 				lock.lock();
 			}
-			if (batch_ || terminal_) {
+			if (frame_ || terminal_) {
 				break;
 			}
 			const auto now = std::chrono::system_clock::now();
@@ -251,8 +182,8 @@ public:
 			}
 			condition_.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(100)));
 		}
-		if (batch_) {
-			*output = std::exchange(batch_, nullptr);
+		if (frame_) {
+			*output = std::exchange(frame_, nullptr);
 			condition_.notify_all();
 			return arrow::Status::OK();
 		}
@@ -270,10 +201,10 @@ public:
 			if (!terminal_) {
 				terminal_ = true;
 				terminal_status_ = timed_out ? flight_error(flight::FlightStatusCode::TimedOut,
-				                                            "sidecar execution deadline expired", "DEADLINE_EXCEEDED")
-				                             : flight_error(flight::FlightStatusCode::Cancelled,
-				                                            "sidecar execution was cancelled", "CANCELLED");
-				batch_.reset();
+															"sidecar execution deadline expired", "DEADLINE_EXCEEDED")
+											 : flight_error(flight::FlightStatusCode::Cancelled,
+															"sidecar execution was cancelled", "CANCELLED");
+				frame_.reset();
 			}
 			unstarted = !worker_.joinable();
 		}
@@ -293,7 +224,7 @@ public:
 	bool cancel_and_join(bool timed_out, const std::function<bool()> &stop_waiting = {}) {
 		(void)cancel(timed_out);
 		const auto deadline =
-		    std::chrono::system_clock::time_point(std::chrono::milliseconds(request_.deadline_unix_ms));
+			std::chrono::system_clock::time_point(std::chrono::milliseconds(request_.deadline_unix_ms));
 		{
 			std::unique_lock lock(mutex_);
 			while (!quiesced_ || stream_inputs_.active_handlers() != 0) {
@@ -321,51 +252,65 @@ public:
 		}
 	}
 
-private:
-	sirius::offload::chunk_action consume(const duckdb::DataChunk &chunk) {
+  private:
+	sirius::offload::chunk_action publish(std::string payload) {
+		if (payload.size() > request_.max_batch_bytes) {
+			throw std::runtime_error("MO native result batch exceeds negotiated max_batch_bytes");
+		}
+		auto frame = arrow::Buffer::FromString(serialize_native_batch_frame(++sequence_, payload));
+		std::unique_lock lock(mutex_);
+		condition_.wait(lock, [&] { return !frame_ || terminal_; });
+		if (terminal_) {
+			return sirius::offload::chunk_action::CANCEL;
+		}
+		frame_ = std::move(frame);
+		condition_.notify_all();
+		condition_.wait(lock, [&] { return !frame_ || terminal_; });
+		return terminal_ ? sirius::offload::chunk_action::CANCEL : sirius::offload::chunk_action::CONTINUE;
+	}
+
+	sirius::offload::chunk_action consume_batch(const std::shared_ptr<cucascade::data_batch> &batch,
+												rmm::cuda_stream_view stream) {
 		if (now_unix_ms() >= request_.deadline_unix_ms) {
 			cancel(true);
 			return sirius::offload::chunk_action::CANCEL;
 		}
-		{
-			std::unique_lock lock(mutex_);
-			condition_.wait(lock, [&] { return !batch_ || terminal_; });
-			if (terminal_) {
+		native_result_batch_encoder encoder(batch, *connection_->context, schema_, stream);
+		std::size_t offset = 0;
+		while (offset < encoder.rows()) {
+			std::size_t rows = encoder.rows() - offset;
+			while (encoder.encoded_size(offset, rows) > request_.max_batch_bytes) {
+				if (rows == 1) {
+					throw std::runtime_error("one MO native result row exceeds negotiated max_batch_bytes");
+				}
+				rows /= 2;
+			}
+			auto payload = encoder.encode(offset, rows);
+			if (publish(std::move(payload)) == sirius::offload::chunk_action::CANCEL) {
 				return sirius::offload::chunk_action::CANCEL;
 			}
+			offset += rows;
 		}
-		auto converted = convert_chunk(chunk, *connection_->context, schema_);
-		if (batch_bytes(*converted) > request_.max_batch_bytes) {
-			throw std::runtime_error("Arrow result batch exceeds negotiated max_batch_bytes");
-		}
-
-		std::unique_lock lock(mutex_);
-		if (terminal_) {
-			return sirius::offload::chunk_action::CANCEL;
-		}
-		batch_ = std::move(converted);
-		condition_.notify_all();
-		condition_.wait(lock, [&] { return !batch_ || terminal_; });
-		return terminal_ ? sirius::offload::chunk_action::CANCEL : sirius::offload::chunk_action::CONTINUE;
+		return sirius::offload::chunk_action::CONTINUE;
 	}
 
 	void run() noexcept {
 		arrow::Status status = arrow::Status::OK();
 		sirius::execution_outcome outcome = sirius::execution_outcome::SUCCEEDED;
 		try {
-			execution_->run([this](const duckdb::DataChunk &chunk) { return consume(chunk); });
+			execution_->run_batches([this](const auto &batch, auto stream) { return consume_batch(batch, stream); });
 		} catch (const sirius::offload::substrait_execution_error &error) {
 			status = substrait_error(error);
 			outcome = error.code() == sirius::offload::substrait_error_code::CANCELLED
-			              ? sirius::execution_outcome::CANCELLED
-			              : sirius::execution_outcome::FAILED;
+						  ? sirius::execution_outcome::CANCELLED
+						  : sirius::execution_outcome::FAILED;
 		} catch (const std::exception &error) {
 			status = flight_error(flight::FlightStatusCode::Internal,
-			                      std::string("sidecar result streaming failed: ") + error.what(), "EXECUTION_FAILED");
+								  std::string("sidecar result streaming failed: ") + error.what(), "EXECUTION_FAILED");
 			outcome = sirius::execution_outcome::FAILED;
 		} catch (...) {
 			status =
-			    flight_error(flight::FlightStatusCode::Internal, "sidecar result streaming failed", "EXECUTION_FAILED");
+				flight_error(flight::FlightStatusCode::Internal, "sidecar result streaming failed", "EXECUTION_FAILED");
 			outcome = sirius::execution_outcome::FAILED;
 		}
 		finish(std::move(status), outcome);
@@ -415,11 +360,12 @@ private:
 	std::unique_ptr<duckdb::Connection> connection_;
 	std::shared_ptr<sirius::execution_evidence> evidence_;
 	std::unique_ptr<sirius::offload::substrait_execution> execution_;
-	std::shared_ptr<arrow::Schema> schema_;
+	native_result_schema schema_;
 
 	std::mutex mutex_;
 	std::condition_variable condition_;
-	std::shared_ptr<arrow::RecordBatch> batch_;
+	std::shared_ptr<arrow::Buffer> frame_;
+	std::uint64_t sequence_ = 0;
 	arrow::Status terminal_status_ = arrow::Status::OK();
 	bool claimed_ = false;
 	bool terminal_ = false;
@@ -432,22 +378,43 @@ private:
 	std::thread worker_;
 };
 
-class entry_reader final : public arrow::RecordBatchReader {
-public:
-	entry_reader(std::shared_ptr<execution_entry> entry, const flight::ServerCallContext &context)
-	    : entry_(std::move(entry)), context_(context) {
+class native_result_stream final : public flight::FlightDataStream {
+  public:
+	native_result_stream(std::shared_ptr<execution_entry> entry, const flight::ServerCallContext &context)
+		: entry_(std::move(entry)), context_(context) {
 		entry_->start();
 	}
 
-	~entry_reader() override {
-		(void)Close();
-	}
+	~native_result_stream() override { (void)Close(); }
 
-	std::shared_ptr<arrow::Schema> schema() const override {
-		return entry_->schema();
+	std::shared_ptr<arrow::Schema> schema() override { return arrow::schema({}); }
+	arrow::Result<flight::FlightPayload> GetSchemaPayload() override {
+		flight::FlightPayload payload;
+		// Flight requires a leading Arrow IPC schema even though protocol v5
+		// carries no Arrow result data. Emit an empty transport schema; the exact
+		// MO physical schema was already echoed in FlightInfo.schema.
+		auto empty_schema = schema();
+		arrow::ipc::DictionaryFieldMapper mapper(*empty_schema);
+		auto status = arrow::ipc::GetSchemaPayload(*empty_schema, arrow::ipc::IpcWriteOptions::Defaults(), mapper,
+												   &payload.ipc_message);
+		if (!status.ok()) {
+			return status;
+		}
+		return payload;
 	}
-	arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override {
-		return entry_->read_next(context_, batch);
+	arrow::Result<flight::FlightPayload> Next() override {
+		std::shared_ptr<arrow::Buffer> frame;
+		auto status = entry_->read_next(context_, &frame);
+		if (!status.ok()) {
+			return status;
+		}
+		flight::FlightPayload payload;
+		// Flight treats a null IPC metadata pointer as EOF. Carry the native
+		// MOB1 frame directly as FlightData.data_header; no Arrow result body or
+		// application-metadata side channel is involved.
+		payload.ipc_message.type = arrow::ipc::MessageType::RECORD_BATCH;
+		payload.ipc_message.metadata = std::move(frame);
+		return payload;
 	}
 	arrow::Status Close() override {
 		if (!closed_.exchange(true)) {
@@ -456,21 +423,18 @@ public:
 		return arrow::Status::OK();
 	}
 
-private:
+  private:
 	std::shared_ptr<execution_entry> entry_;
 	const flight::ServerCallContext &context_;
-	std::atomic<bool> closed_ {false};
+	std::atomic<bool> closed_{false};
 };
 
 class ticket_registry final {
-public:
+  public:
 	ticket_registry(duckdb::DatabaseInstance &database, const runtime_config &config)
-	    : database_(database), config_(config), reaper_([this] { reap(); }) {
-	}
+		: database_(database), config_(config), reaper_([this] { reap(); }) {}
 
-	~ticket_registry() {
-		shutdown();
-	}
+	~ticket_registry() { shutdown(); }
 
 	arrow::Result<std::shared_ptr<execution_entry>> prepare(execute_request request) {
 		std::shared_ptr<execution_entry> existing;
@@ -484,39 +448,39 @@ public:
 				if (idempotency == idempotency_.end()) {
 					if (entries_.size() + reserved_ >= config_.max_active_tickets) {
 						return flight_error(flight::FlightStatusCode::Unavailable,
-						                    "sidecar active ticket limit reached", "RESOURCE_EXHAUSTED");
+											"sidecar active ticket limit reached", "RESOURCE_EXHAUSTED");
 					}
 					++reserved_;
 					idempotency_.emplace(request.idempotency_key,
-					                     idempotency_record {.fingerprint = request.fingerprint,
-					                                         .ticket = {},
-					                                         .deadline_unix_ms = request.deadline_unix_ms,
-					                                         .preparing = true});
+										 idempotency_record{.fingerprint = request.fingerprint,
+															.ticket = {},
+															.deadline_unix_ms = request.deadline_unix_ms,
+															.preparing = true});
 					break;
 				}
 				if (idempotency->second.fingerprint != request.fingerprint) {
 					return flight_error(flight::FlightStatusCode::Failed,
-					                    "idempotency key was reused for a different request", "IDEMPOTENCY_CONFLICT");
+										"idempotency key was reused for a different request", "IDEMPOTENCY_CONFLICT");
 				}
 				if (idempotency->second.preparing) {
 					const auto deadline = std::chrono::system_clock::time_point(
-					    std::chrono::milliseconds(idempotency->second.deadline_unix_ms));
+						std::chrono::milliseconds(idempotency->second.deadline_unix_ms));
 					if (state_changed_.wait_until(lock, deadline) == std::cv_status::timeout) {
 						return flight_error(flight::FlightStatusCode::TimedOut,
-						                    "idempotent request did not finish preparing "
-						                    "before its deadline",
-						                    "IDEMPOTENCY_IN_PROGRESS");
+											"idempotent request did not finish preparing "
+											"before its deadline",
+											"IDEMPOTENCY_IN_PROGRESS");
 					}
 					continue;
 				}
 				if (idempotency->second.cancel_requested) {
 					return flight_error(flight::FlightStatusCode::Failed, "idempotent request is already terminal",
-					                    "IDEMPOTENCY_TERMINAL");
+										"IDEMPOTENCY_TERMINAL");
 				}
 				const auto found = entries_.find(idempotency->second.ticket);
 				if (found == entries_.end()) {
 					return flight_error(flight::FlightStatusCode::Internal,
-					                    "idempotent request lost its prepared ticket", "IDEMPOTENCY_STATE_INVALID");
+										"idempotent request lost its prepared ticket", "IDEMPOTENCY_STATE_INVALID");
 				}
 				existing = found->second;
 				break;
@@ -525,7 +489,7 @@ public:
 		if (existing) {
 			if (!existing->replayable()) {
 				return flight_error(flight::FlightStatusCode::Failed, "idempotent request ticket was already claimed",
-				                    "IDEMPOTENCY_ALREADY_CLAIMED");
+									"IDEMPOTENCY_ALREADY_CLAIMED");
 			}
 			return existing;
 		}
@@ -538,8 +502,8 @@ public:
 				ticket = random_ticket();
 			} while (contains(ticket));
 			entry = std::make_shared<execution_entry>(
-			    database_, config_, std::move(request), ticket,
-			    [this](const std::string &completed_ticket) { remove(completed_ticket); });
+				database_, config_, std::move(request), ticket,
+				[this](const std::string &completed_ticket) { remove(completed_ticket); });
 		} catch (...) {
 			release_reservation(idempotency_key);
 			throw;
@@ -571,7 +535,7 @@ public:
 		if (cancel_requested) {
 			(void)entry->cancel_and_join(false);
 			return flight_error(flight::FlightStatusCode::Cancelled, "idempotent request was cancelled while preparing",
-			                    "CANCELLED");
+								"CANCELLED");
 		}
 		return entry;
 	}
@@ -617,7 +581,7 @@ public:
 	}
 
 	cancel_result cancel_and_join_idempotency(const std::string &idempotency_key,
-	                                          const std::function<bool()> &stop_waiting = {}) {
+											  const std::function<bool()> &stop_waiting = {}) {
 		std::shared_ptr<execution_entry> entry;
 		{
 			std::unique_lock lock(mutex_);
@@ -639,7 +603,7 @@ public:
 					break;
 				}
 				const auto deadline =
-				    std::chrono::system_clock::time_point(std::chrono::milliseconds(found->second.deadline_unix_ms));
+					std::chrono::system_clock::time_point(std::chrono::milliseconds(found->second.deadline_unix_ms));
 				lock.unlock();
 				const bool stopped_waiting = stop_waiting && stop_waiting();
 				lock.lock();
@@ -695,7 +659,7 @@ public:
 		state_changed_.notify_all();
 	}
 
-private:
+  private:
 	bool contains(const std::string &ticket) {
 		std::lock_guard lock(mutex_);
 		return entries_.contains(ticket);
@@ -760,37 +724,29 @@ private:
 };
 
 class input_handler_guard final {
-public:
+  public:
 	input_handler_guard(std::shared_ptr<execution_entry> entry, std::shared_ptr<stream_input> input)
-	    : entry_(std::move(entry)), input_(std::move(input)) {
-	}
-	~input_handler_guard() {
-		entry_->detach_input(input_);
-	}
+		: entry_(std::move(entry)), input_(std::move(input)) {}
+	~input_handler_guard() { entry_->detach_input(input_); }
 
 	input_handler_guard(const input_handler_guard &) = delete;
 	input_handler_guard &operator=(const input_handler_guard &) = delete;
 
-private:
+  private:
 	std::shared_ptr<execution_entry> entry_;
 	std::shared_ptr<stream_input> input_;
 };
 
 class sidecar_flight_server final : public flight::FlightServerBase {
-public:
+  public:
 	sidecar_flight_server(duckdb::DatabaseInstance &database, const runtime_config &config)
-	    : config_(config), registry_(database, config) {
-	}
+		: config_(config), registry_(database, config) {}
 
-	void stop_registry() noexcept {
-		registry_.shutdown();
-	}
-	void stop_admission() noexcept {
-		registry_.stop_admission_and_cancel();
-	}
+	void stop_registry() noexcept { registry_.shutdown(); }
+	void stop_admission() noexcept { registry_.stop_admission_and_cancel(); }
 
 	arrow::Status GetFlightInfo(const flight::ServerCallContext &context, const flight::FlightDescriptor &descriptor,
-	                            std::unique_ptr<flight::FlightInfo> *info) override {
+								std::unique_ptr<flight::FlightInfo> *info) override {
 		if (descriptor.type != flight::FlightDescriptor::CMD) {
 			return arrow::Status::Invalid("ExecuteSubstrait requires a command descriptor");
 		}
@@ -798,24 +754,24 @@ public:
 			auto request = parse_execute_request(descriptor.cmd);
 			if (request.idempotency_key != execution_idempotency_key(request.account_id, request.query_id)) {
 				return flight_error(flight::FlightStatusCode::Unauthorized,
-				                    "ExecuteSubstrait idempotency key does not match its identity",
-				                    "AUTHENTICATION_FAILED");
+									"ExecuteSubstrait idempotency key does not match its identity",
+									"AUTHENTICATION_FAILED");
 			}
 			request.fingerprint = sha256_bytes(descriptor.cmd);
 			const auto now = now_unix_ms();
 			if (request.protocol_version != k_protocol_version || request.substrait_version != k_substrait_version) {
 				return flight_error(flight::FlightStatusCode::Failed,
-				                    "unsupported sidecar or Substrait protocol version", "UNSUPPORTED_VERSION");
+									"unsupported sidecar or Substrait protocol version", "UNSUPPORTED_VERSION");
 			}
 			if (request.capability_hash != capability_hash()) {
 				return flight_error(flight::FlightStatusCode::Failed, "sidecar capability hash mismatch",
-				                    "CAPABILITY_MISMATCH");
+									"CAPABILITY_MISMATCH");
 			}
 			if (request.max_batch_bytes == 0 || request.max_batch_bytes > config_.max_batch_bytes) {
 				return arrow::Status::Invalid("max_batch_bytes exceeds the sidecar limit");
 			}
 			if (request.max_input_batch_bytes == 0 || request.max_input_batch_bytes > k_max_stream_input_batch_bytes ||
-			    request.max_input_batch_bytes > config_.max_batch_bytes) {
+				request.max_input_batch_bytes > config_.max_batch_bytes) {
 				return arrow::Status::Invalid("max_input_batch_bytes exceeds the sidecar limit");
 			}
 			if (request.deadline_unix_ms <= now) {
@@ -837,20 +793,10 @@ public:
 			}
 
 			std::vector<flight::FlightEndpoint> endpoints;
-			endpoints.emplace_back(flight::Ticket(entry->ticket()), std::vector<flight::Location> {}, std::nullopt,
-			                       std::string {});
-			auto serialized_schema = arrow::ipc::SerializeSchema(*entry->schema(), arrow::system_memory_pool());
-			if (!serialized_schema.ok()) {
-				entry->cancel(false);
-				return serialized_schema.status();
-			}
-			flight::FlightInfo::Data data {std::move(serialized_schema).ValueOrDie()->ToString(),
-			                               descriptor,
-			                               std::move(endpoints),
-			                               -1,
-			                               -1,
-			                               false,
-			                               capability_hash()};
+			endpoints.emplace_back(flight::Ticket(entry->ticket()), std::vector<flight::Location>{}, std::nullopt,
+								   std::string{});
+			flight::FlightInfo::Data data{entry->schema_wire(), descriptor, std::move(endpoints), -1, -1, false,
+										  capability_hash()};
 			*info = std::make_unique<flight::FlightInfo>(std::move(data));
 			return arrow::Status::OK();
 		} catch (const sirius::offload::substrait_execution_error &error) {
@@ -859,23 +805,22 @@ public:
 			return arrow::Status::Invalid(error.what());
 		} catch (const std::exception &error) {
 			return flight_error(flight::FlightStatusCode::Internal,
-			                    std::string("cannot prepare sidecar execution: ") + error.what());
+								std::string("cannot prepare sidecar execution: ") + error.what());
 		}
 	}
 
 	arrow::Status DoGet(const flight::ServerCallContext &context, const flight::Ticket &request,
-	                    std::unique_ptr<flight::FlightDataStream> *stream) override {
+						std::unique_ptr<flight::FlightDataStream> *stream) override {
 		auto entry = registry_.claim(request.ticket);
 		if (!entry) {
 			return arrow::Status::KeyError("unknown, expired, or already claimed ticket");
 		}
-		auto reader = std::make_shared<entry_reader>(std::move(entry), context);
-		*stream = std::make_unique<flight::RecordBatchStream>(reader);
+		*stream = std::make_unique<native_result_stream>(std::move(entry), context);
 		return arrow::Status::OK();
 	}
 
 	arrow::Status DoPut(const flight::ServerCallContext &context, std::unique_ptr<flight::FlightMessageReader> reader,
-	                    std::unique_ptr<flight::FlightMetadataWriter> writer) override {
+						std::unique_ptr<flight::FlightMetadataWriter> writer) override {
 		std::shared_ptr<execution_entry> entry;
 		try {
 			if (!reader || !writer || reader->descriptor().type != flight::FlightDescriptor::CMD) {
@@ -892,10 +837,8 @@ public:
 			}
 			auto input = std::move(attached).ValueOrDie();
 			input_handler_guard guard(entry, input);
-			const auto stopped = [&] {
-				return context.is_cancelled();
-			};
-			auto attached_ack = arrow::Buffer::FromString(serialize_upload_input_ack(upload_input_ack {.ready = true}));
+			const auto stopped = [&] { return context.is_cancelled(); };
+			auto attached_ack = arrow::Buffer::FromString(serialize_upload_input_ack(upload_input_ack{.ready = true}));
 			const auto attached_status = writer->WriteMetadata(*attached_ack);
 			if (!attached_status.ok()) {
 				entry->fail_input(attached_status.ToString());
@@ -923,7 +866,7 @@ public:
 					return arrow::Status::Invalid("UploadInput accepts MO-native metadata frames only");
 				}
 				if (static_cast<std::uint64_t>(chunk.app_metadata->size()) >
-				    entry->max_input_batch_bytes() + k_native_batch_frame_header_bytes) {
+					entry->max_input_batch_bytes() + k_native_batch_frame_header_bytes) {
 					entry->fail_input("MO native input frame exceeds the negotiated limit");
 					return arrow::Status::Invalid("MO native input frame exceeds the negotiated limit");
 				}
@@ -953,7 +896,7 @@ public:
 				entry->fail_input(error.what());
 			}
 			return flight_error(flight::FlightStatusCode::Internal,
-			                    std::string("native input upload failed: ") + error.what());
+								std::string("native input upload failed: ") + error.what());
 		}
 	}
 
@@ -964,7 +907,7 @@ public:
 	}
 
 	arrow::Status DoAction(const flight::ServerCallContext &context, const flight::Action &action,
-	                       std::unique_ptr<flight::ResultStream> *result) override {
+						   std::unique_ptr<flight::ResultStream> *result) override {
 		std::vector<flight::Result> results;
 		if (action.type == "GetCapabilities") {
 			if (action.body && action.body->size() != 0) {
@@ -978,22 +921,20 @@ public:
 			cancel_request request;
 			try {
 				request = parse_cancel_request(
-				    std::string_view(reinterpret_cast<const char *>(action.body->data()), action.body->size()));
+					std::string_view(reinterpret_cast<const char *>(action.body->data()), action.body->size()));
 			} catch (const std::invalid_argument &error) {
 				return arrow::Status::Invalid(error.what());
 			}
-			const auto stop_waiting = [&context] {
-				return context.is_cancelled();
-			};
+			const auto stop_waiting = [&context] { return context.is_cancelled(); };
 			const auto cancelled = request.ticket.empty()
-			                           ? registry_.cancel_and_join_idempotency(request.idempotency_key, stop_waiting)
-			                           : registry_.cancel_and_join(request.ticket, stop_waiting);
+									   ? registry_.cancel_and_join_idempotency(request.idempotency_key, stop_waiting)
+									   : registry_.cancel_and_join(request.ticket, stop_waiting);
 			if (cancelled == ticket_registry::cancel_result::DEADLINE_EXCEEDED) {
 				return flight_error(flight::FlightStatusCode::TimedOut,
-				                    "sidecar execution did not quiesce before its deadline", "CANCEL_NOT_QUIESCED");
+									"sidecar execution did not quiesce before its deadline", "CANCEL_NOT_QUIESCED");
 			}
 			results.emplace_back(arrow::Buffer::FromString(
-			    cancelled == ticket_registry::cancel_result::QUIESCED ? "quiesced" : "not-found"));
+				cancelled == ticket_registry::cancel_result::QUIESCED ? "quiesced" : "not-found"));
 		} else {
 			return arrow::Status::NotImplemented("unknown sidecar action: ", action.type);
 		}
@@ -1001,7 +942,7 @@ public:
 		return arrow::Status::OK();
 	}
 
-private:
+  private:
 	const runtime_config &config_;
 	ticket_registry registry_;
 };
@@ -1009,25 +950,21 @@ private:
 } // namespace
 
 class flight_runtime::impl {
-public:
+  public:
 	impl(duckdb::DatabaseInstance &database, runtime_config config)
-	    : config(std::move(config)), server(database, this->config) {
-	}
+		: config(std::move(config)), server(database, this->config) {}
 
 	runtime_config config;
 	sidecar_flight_server server;
 	std::thread server_thread;
 	std::mutex stop_mutex;
-	std::atomic<bool> started {false};
+	std::atomic<bool> started{false};
 };
 
 flight_runtime::flight_runtime(duckdb::DatabaseInstance &database, runtime_config config)
-    : impl_(std::make_unique<impl>(database, std::move(config))) {
-}
+	: impl_(std::make_unique<impl>(database, std::move(config))) {}
 
-flight_runtime::~flight_runtime() noexcept {
-	stop();
-}
+flight_runtime::~flight_runtime() noexcept { stop(); }
 
 void flight_runtime::start() {
 	// Arrow's conda jemalloc backend conflicts with DuckDB/Sirius allocator
@@ -1042,7 +979,7 @@ void flight_runtime::start() {
 	}
 	flight::FlightServerOptions options(std::move(location).ValueOrDie());
 	options.tls_certificates.push_back(
-	    {read_secret_file(impl_->config.flight_cert_path), read_secret_file(impl_->config.flight_key_path)});
+		{read_secret_file(impl_->config.flight_cert_path), read_secret_file(impl_->config.flight_key_path)});
 	options.verify_client = true;
 	options.root_certificates = read_secret_file(impl_->config.flight_client_ca_path);
 	const auto maximum_receive = static_cast<int>(k_max_plan_bytes + 1024U * 1024U);

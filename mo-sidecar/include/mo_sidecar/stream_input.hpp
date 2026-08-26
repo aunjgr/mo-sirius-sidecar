@@ -4,6 +4,7 @@
 #pragma once
 
 #include "mo_sidecar/protocol.hpp"
+#include "offload/mo_native_batch.hpp"
 #include "offload/stream_read.hpp"
 #include "tae_types.hpp"
 
@@ -25,30 +26,19 @@
 
 namespace matrixone::sidecar {
 
-struct native_column_view {
-	std::uint8_t vector_class = 0;
-	tae::MOType type {};
-	std::uint32_t logical_rows = 0;
-	std::string_view data;
-	std::string_view area;
-	std::string_view null_words;
-	std::uint64_t null_count = 0;
-	bool sorted = false;
+using native_column_view = sirius::offload::mo_native_column_view;
 
-	bool is_null(std::uint64_t row) const noexcept;
-};
-
-class native_batch_view final {
-public:
+class native_batch_view final : public sirius::offload::mo_native_batch {
+  public:
 	native_batch_view(std::shared_ptr<arrow::Buffer> frame, native_batch_frame envelope,
-	                  const ::substrait::NamedStruct &schema);
+					  const ::substrait::NamedStruct &schema);
 
-	std::uint64_t sequence() const noexcept;
-	std::uint64_t rows() const noexcept;
-	std::uint64_t payload_bytes() const noexcept;
-	const std::vector<native_column_view> &columns() const noexcept;
+	std::uint64_t sequence() const noexcept override;
+	std::uint64_t rows() const noexcept override;
+	std::uint64_t payload_bytes() const noexcept override;
+	const std::vector<native_column_view> &columns() const noexcept override;
 
-private:
+  private:
 	std::shared_ptr<arrow::Buffer> frame_;
 	std::uint64_t sequence_ = 0;
 	std::uint64_t rows_ = 0;
@@ -56,8 +46,9 @@ private:
 	std::vector<native_column_view> columns_;
 };
 
-class stream_input final : public std::enable_shared_from_this<stream_input> {
-public:
+class stream_input final : public std::enable_shared_from_this<stream_input>,
+						   public sirius::offload::mo_native_batch_source {
+  public:
 	stream_input(sirius::offload::stream_read request, const ::substrait::NamedStruct &schema);
 
 	const sirius::offload::stream_read &request() const noexcept;
@@ -70,12 +61,12 @@ public:
 	arrow::Result<upload_input_ack> finish_upload(const std::function<bool()> &stopped);
 	void detach() noexcept;
 
-	std::shared_ptr<native_batch_view> next_batch();
-	void mark_consumed(std::uint64_t sequence) noexcept;
+	std::shared_ptr<sirius::offload::mo_native_batch> next_batch() override;
+	void mark_consumed(std::uint64_t sequence) noexcept override;
 	void mark_not_needed() noexcept;
 	void cancel(std::string error) noexcept;
 
-private:
+  private:
 	arrow::Status terminal_status_locked() const;
 
 	sirius::offload::stream_read request_;
@@ -99,9 +90,9 @@ private:
 };
 
 class stream_input_registry final {
-public:
+  public:
 	std::shared_ptr<stream_input> create(const sirius::offload::stream_read &request,
-	                                     const ::substrait::NamedStruct &schema);
+										 const ::substrait::NamedStruct &schema);
 	std::shared_ptr<stream_input> find(const std::string &stream_ref) const;
 	void mark_all_not_needed() noexcept;
 	void cancel_all(const std::string &error) noexcept;
@@ -110,10 +101,10 @@ public:
 	void handler_attached() noexcept;
 	void handler_detached() noexcept;
 
-private:
+  private:
 	mutable std::mutex mutex_;
 	std::unordered_map<std::string, std::shared_ptr<stream_input>> inputs_;
-	std::atomic<std::size_t> active_handlers_ {0};
+	std::atomic<std::size_t> active_handlers_{0};
 };
 
 duckdb::TableFunction get_stream_scan_function();

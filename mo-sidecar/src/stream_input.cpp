@@ -12,6 +12,21 @@
 #include <stdexcept>
 #include <utility>
 
+bool sirius::offload::mo_native_column_view::is_null(std::uint64_t row) const noexcept {
+	if (null_count == 0 || null_words.empty()) {
+		return false;
+	}
+	const auto offset = static_cast<std::size_t>(row / 64U) * 8U;
+	if (offset + 8U > null_words.size()) {
+		return false;
+	}
+	std::uint64_t word = 0;
+	for (unsigned i = 0; i < 8; ++i) {
+		word |= static_cast<std::uint64_t>(static_cast<unsigned char>(null_words[offset + i])) << (i * 8U);
+	}
+	return (word & (std::uint64_t{1} << (row % 64U))) != 0;
+}
+
 namespace matrixone::sidecar {
 namespace {
 
@@ -21,9 +36,8 @@ constexpr std::size_t mo_type_bytes = 16;
 constexpr std::size_t mo_bitmap_header_bytes = 24;
 
 class cursor {
-public:
-	explicit cursor(std::string_view bytes) : bytes_(bytes) {
-	}
+  public:
+	explicit cursor(std::string_view bytes) : bytes_(bytes) {}
 
 	std::string_view read(std::size_t size) {
 		if (size > bytes_.size() - position_) {
@@ -43,9 +57,7 @@ public:
 		return value;
 	}
 
-	std::int32_t i32() {
-		return static_cast<std::int32_t>(u32());
-	}
+	std::int32_t i32() { return static_cast<std::int32_t>(u32()); }
 
 	std::uint64_t u64() {
 		const auto bytes = read(8);
@@ -56,15 +68,11 @@ public:
 		return value;
 	}
 
-	std::int64_t i64() {
-		return static_cast<std::int64_t>(u64());
-	}
+	std::int64_t i64() { return static_cast<std::int64_t>(u64()); }
 
-	bool done() const noexcept {
-		return position_ == bytes_.size();
-	}
+	bool done() const noexcept { return position_ == bytes_.size(); }
 
-private:
+  private:
 	std::string_view bytes_;
 	std::size_t position_ = 0;
 };
@@ -108,8 +116,8 @@ bool substrait_matches_mo(const ::substrait::Type &expected, const tae::MOType &
 		return actual.oid == oid::MO_T_date;
 	case ::substrait::Type::kDecimal:
 		return (expected.decimal().precision() <= 18 ? actual.oid == oid::MO_T_decimal64
-		                                             : actual.oid == oid::MO_T_decimal128) &&
-		       actual.width == expected.decimal().precision() && actual.scale == expected.decimal().scale();
+													 : actual.oid == oid::MO_T_decimal128) &&
+			   actual.width == expected.decimal().precision() && actual.scale == expected.decimal().scale();
 	default:
 		return false;
 	}
@@ -146,6 +154,7 @@ duckdb::LogicalType logical_type(const ::substrait::Type &type) {
 native_column_view parse_column(std::string_view bytes, std::uint64_t batch_rows, const ::substrait::Type &expected) {
 	cursor input(bytes);
 	native_column_view result;
+	result.encoded = bytes;
 	result.vector_class = static_cast<std::uint8_t>(input.read(1)[0]);
 	if (result.vector_class != mo_vector_flat && result.vector_class != mo_vector_constant) {
 		throw std::invalid_argument("unsupported MO vector class");
@@ -171,8 +180,8 @@ native_column_view parse_column(std::string_view bytes, std::uint64_t batch_rows
 	const auto fixed_size = tae::MOTypeFixedSize(static_cast<tae::MOTypeOid>(result.type.oid));
 	const auto element_size = fixed_size < 0 ? static_cast<std::int32_t>(tae::VARLENA_SIZE) : fixed_size;
 	const std::uint64_t expected_data = result.vector_class == mo_vector_constant
-	                                        ? (result.data.empty() ? 0U : static_cast<std::uint64_t>(element_size))
-	                                        : batch_rows * static_cast<std::uint64_t>(element_size);
+											? (result.data.empty() ? 0U : static_cast<std::uint64_t>(element_size))
+											: batch_rows * static_cast<std::uint64_t>(element_size);
 	if (expected_data != result.data.size() || (fixed_size >= 0 && !result.area.empty())) {
 		throw std::invalid_argument("invalid MO vector data or area length");
 	}
@@ -185,9 +194,9 @@ native_column_view parse_column(std::string_view bytes, std::uint64_t batch_rows
 		const auto bit_length = load_u64(nulls, 8);
 		const auto word_bytes = load_u64(nulls, 16);
 		if (count < 0 || static_cast<std::uint64_t>(count) > batch_rows || bit_length < batch_rows ||
-		    bit_length > std::numeric_limits<std::uint32_t>::max() ||
-		    word_bytes != nulls.size() - mo_bitmap_header_bytes || word_bytes % 8 != 0 ||
-		    word_bytes / 8 != (bit_length + 63) / 64) {
+			bit_length > std::numeric_limits<std::uint32_t>::max() ||
+			word_bytes != nulls.size() - mo_bitmap_header_bytes || word_bytes % 8 != 0 ||
+			word_bytes / 8 != (bit_length + 63) / 64) {
 			throw std::invalid_argument("invalid MO null bitmap header");
 		}
 		result.null_count = static_cast<std::uint64_t>(count);
@@ -199,7 +208,7 @@ native_column_view parse_column(std::string_view bytes, std::uint64_t batch_rows
 			const auto first_row = offset / 8 * 64;
 			const auto remaining = first_row < batch_rows ? batch_rows - first_row : 0;
 			const auto allowed = remaining >= 64 ? std::numeric_limits<std::uint64_t>::max()
-			                                     : (remaining == 0 ? 0 : (std::uint64_t {1} << remaining) - 1);
+												 : (remaining == 0 ? 0 : (std::uint64_t{1} << remaining) - 1);
 			if ((word & ~allowed) != 0) {
 				throw std::invalid_argument("MO null bitmap contains rows outside the batch");
 			}
@@ -215,7 +224,7 @@ native_column_view parse_column(std::string_view bytes, std::uint64_t batch_rows
 			throw std::invalid_argument("invalid MO varlena descriptor length");
 		}
 		for (std::uint32_t row = 0; row < rows; ++row) {
-			tae::Varlena value {};
+			tae::Varlena value{};
 			std::memcpy(&value, result.data.data() + row * tae::VARLENA_SIZE, sizeof(value));
 			if (value.is_inline()) {
 				continue;
@@ -225,7 +234,7 @@ native_column_view parse_column(std::string_view bytes, std::uint64_t batch_rows
 			const auto offset = value.big_offset();
 			const auto length = value.big_length();
 			if (marker != tae::VARLENA_BIG_MARKER || offset > result.area.size() ||
-			    length > result.area.size() - offset) {
+				length > result.area.size() - offset) {
 				throw std::invalid_argument("MO varlena descriptor is outside its area");
 			}
 		}
@@ -234,7 +243,7 @@ native_column_view parse_column(std::string_view bytes, std::uint64_t batch_rows
 }
 
 void fill_column(duckdb::Vector &output, const native_column_view &column, duckdb::idx_t count,
-                 duckdb::idx_t source_offset) {
+				 duckdb::idx_t source_offset) {
 	const bool constant = column.vector_class == mo_vector_constant;
 	if (constant) {
 		output.SetVectorType(duckdb::VectorType::CONSTANT_VECTOR);
@@ -247,21 +256,19 @@ void fill_column(duckdb::Vector &output, const native_column_view &column, duckd
 		output.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
 		duckdb::FlatVector::Validity(output).SetAllValid(count);
 	}
-	const auto source_row = [&](duckdb::idx_t row) {
-		return constant ? 0U : source_offset + row;
-	};
+	const auto source_row = [&](duckdb::idx_t row) { return constant ? 0U : source_offset + row; };
 	const auto oid = static_cast<tae::MOTypeOid>(column.type.oid);
 
 	if (oid == tae::MO_T_char || oid == tae::MO_T_varchar) {
 		auto *target = constant ? duckdb::ConstantVector::GetData<duckdb::string_t>(output)
-		                        : duckdb::FlatVector::GetData<duckdb::string_t>(output);
+								: duckdb::FlatVector::GetData<duckdb::string_t>(output);
 		const auto rows = constant ? 1U : count;
 		for (duckdb::idx_t row = 0; row < rows; ++row) {
 			const auto index = source_row(row);
 			if (column.is_null(index)) {
 				continue;
 			}
-			tae::Varlena value {};
+			tae::Varlena value{};
 			std::memcpy(&value, column.data.data() + index * tae::VARLENA_SIZE, sizeof(value));
 			const char *data = value.inline_data();
 			std::uint32_t length = value.inline_length();
@@ -273,7 +280,7 @@ void fill_column(duckdb::Vector &output, const native_column_view &column, duckd
 		}
 	} else if (oid == tae::MO_T_date) {
 		auto *target = constant ? duckdb::ConstantVector::GetData<std::int32_t>(output)
-		                        : duckdb::FlatVector::GetData<std::int32_t>(output);
+								: duckdb::FlatVector::GetData<std::int32_t>(output);
 		const auto rows = constant ? 1U : count;
 		for (duckdb::idx_t row = 0; row < rows; ++row) {
 			std::int32_t value = 0;
@@ -301,26 +308,17 @@ void fill_column(duckdb::Vector &output, const native_column_view &column, duckd
 	}
 }
 
-struct stream_bind_data final : public duckdb::TableFunctionData {
-	explicit stream_bind_data(std::shared_ptr<stream_input> input) : input(std::move(input)) {
-	}
-	std::shared_ptr<stream_input> input;
-};
-
 struct stream_global_state final : public duckdb::GlobalTableFunctionState {
-	explicit stream_global_state(std::shared_ptr<stream_input> input) : input(std::move(input)) {
-	}
-	duckdb::idx_t MaxThreads() const override {
-		return 1;
-	}
+	explicit stream_global_state(std::shared_ptr<stream_input> input) : input(std::move(input)) {}
+	duckdb::idx_t MaxThreads() const override { return 1; }
 	std::shared_ptr<stream_input> input;
-	std::shared_ptr<native_batch_view> batch;
+	std::shared_ptr<sirius::offload::mo_native_batch> batch;
 	duckdb::idx_t offset = 0;
 };
 
 duckdb::unique_ptr<duckdb::FunctionData> bind_stream(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
-                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                     duckdb::vector<std::string> &names) {
+													 duckdb::vector<duckdb::LogicalType> &return_types,
+													 duckdb::vector<std::string> &names) {
 	auto *raw = reinterpret_cast<stream_input *>(input.inputs.at(0).GetPointer());
 	if (!raw) {
 		throw std::invalid_argument("mo_stream_scan input is null");
@@ -328,12 +326,17 @@ duckdb::unique_ptr<duckdb::FunctionData> bind_stream(duckdb::ClientContext &, du
 	auto shared = raw->shared_from_this();
 	return_types = shared->types();
 	names = shared->names();
-	return duckdb::make_uniq<stream_bind_data>(std::move(shared));
+	return duckdb::make_uniq<sirius::offload::mo_native_scan_bind_data>(std::move(shared));
 }
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> init_stream(duckdb::ClientContext &,
-                                                                 duckdb::TableFunctionInitInput &input) {
-	return duckdb::make_uniq<stream_global_state>(input.bind_data->Cast<stream_bind_data>().input);
+																 duckdb::TableFunctionInitInput &input) {
+	auto source = std::dynamic_pointer_cast<stream_input>(
+		input.bind_data->Cast<sirius::offload::mo_native_scan_bind_data>().source);
+	if (!source) {
+		throw std::invalid_argument("mo_stream_scan bind data is not a sidecar stream input");
+	}
+	return duckdb::make_uniq<stream_global_state>(std::move(source));
 }
 
 void scan_stream(duckdb::ClientContext &, duckdb::TableFunctionInput &input, duckdb::DataChunk &output) {
@@ -350,7 +353,7 @@ void scan_stream(duckdb::ClientContext &, duckdb::TableFunctionInput &input, duc
 		}
 	}
 	const auto count =
-	    static_cast<duckdb::idx_t>(std::min<std::uint64_t>(STANDARD_VECTOR_SIZE, state.batch->rows() - state.offset));
+		static_cast<duckdb::idx_t>(std::min<std::uint64_t>(STANDARD_VECTOR_SIZE, state.batch->rows() - state.offset));
 	for (duckdb::idx_t column = 0; column < state.batch->columns().size(); ++column) {
 		fill_column(output.data[column], state.batch->columns()[column], count, state.offset);
 	}
@@ -360,22 +363,11 @@ void scan_stream(duckdb::ClientContext &, duckdb::TableFunctionInput &input, duc
 
 } // namespace
 
-bool native_column_view::is_null(std::uint64_t row) const noexcept {
-	if (null_count == 0 || null_words.empty()) {
-		return false;
-	}
-	const auto word_offset = static_cast<std::size_t>(row / 64U) * 8U;
-	if (word_offset + 8U > null_words.size()) {
-		return false;
-	}
-	return (load_u64(null_words, word_offset) & (std::uint64_t {1} << (row % 64U))) != 0;
-}
-
 native_batch_view::native_batch_view(std::shared_ptr<arrow::Buffer> frame, native_batch_frame envelope,
-                                     const ::substrait::NamedStruct &schema)
-    : frame_(std::move(frame)), sequence_(envelope.sequence), payload_bytes_(envelope.payload.size()) {
+									 const ::substrait::NamedStruct &schema)
+	: frame_(std::move(frame)), sequence_(envelope.sequence), payload_bytes_(envelope.payload.size()) {
 	if (std::endian::native != std::endian::little || sizeof(tae::MOType) != mo_type_bytes ||
-	    sizeof(tae::Varlena) != tae::VARLENA_SIZE) {
+		sizeof(tae::Varlena) != tae::VARLENA_SIZE) {
 		throw std::invalid_argument("MO native batch ABI is unsupported on this sidecar");
 	}
 	cursor input(envelope.payload);
@@ -412,21 +404,13 @@ native_batch_view::native_batch_view(std::shared_ptr<arrow::Buffer> frame, nativ
 	}
 }
 
-std::uint64_t native_batch_view::sequence() const noexcept {
-	return sequence_;
-}
-std::uint64_t native_batch_view::rows() const noexcept {
-	return rows_;
-}
-std::uint64_t native_batch_view::payload_bytes() const noexcept {
-	return payload_bytes_;
-}
-const std::vector<native_column_view> &native_batch_view::columns() const noexcept {
-	return columns_;
-}
+std::uint64_t native_batch_view::sequence() const noexcept { return sequence_; }
+std::uint64_t native_batch_view::rows() const noexcept { return rows_; }
+std::uint64_t native_batch_view::payload_bytes() const noexcept { return payload_bytes_; }
+const std::vector<native_column_view> &native_batch_view::columns() const noexcept { return columns_; }
 
 stream_input::stream_input(sirius::offload::stream_read request, const ::substrait::NamedStruct &schema)
-    : request_(std::move(request)), canonical_schema_(schema) {
+	: request_(std::move(request)), canonical_schema_(schema) {
 	if (!schema.has_struct_() || schema.names_size() == 0 || schema.names_size() != schema.struct_().types_size()) {
 		throw std::invalid_argument("StreamRead schema is incomplete");
 	}
@@ -436,18 +420,10 @@ stream_input::stream_input(sirius::offload::stream_read request, const ::substra
 	}
 }
 
-const sirius::offload::stream_read &stream_input::request() const noexcept {
-	return request_;
-}
-const ::substrait::NamedStruct &stream_input::canonical_schema() const noexcept {
-	return canonical_schema_;
-}
-const duckdb::vector<duckdb::LogicalType> &stream_input::types() const noexcept {
-	return types_;
-}
-const duckdb::vector<std::string> &stream_input::names() const noexcept {
-	return names_;
-}
+const sirius::offload::stream_read &stream_input::request() const noexcept { return request_; }
+const ::substrait::NamedStruct &stream_input::canonical_schema() const noexcept { return canonical_schema_; }
+const duckdb::vector<duckdb::LogicalType> &stream_input::types() const noexcept { return types_; }
+const duckdb::vector<std::string> &stream_input::names() const noexcept { return names_; }
 
 arrow::Status stream_input::attach() {
 	std::lock_guard lock(mutex_);
@@ -463,7 +439,7 @@ arrow::Status stream_input::attach() {
 }
 
 arrow::Result<upload_input_ack> stream_input::publish(std::shared_ptr<arrow::Buffer> frame,
-                                                      const std::function<bool()> &stopped) {
+													  const std::function<bool()> &stopped) {
 	if (!frame) {
 		return arrow::Status::Invalid("MO native batch frame is empty");
 	}
@@ -490,7 +466,7 @@ arrow::Result<upload_input_ack> stream_input::publish(std::shared_ptr<arrow::Buf
 		return terminal_status_locked();
 	}
 	if (not_needed_) {
-		return upload_input_ack {acknowledged_batches_, acknowledged_rows_, acknowledged_bytes_, true, true};
+		return upload_input_ack{acknowledged_batches_, acknowledged_rows_, acknowledged_bytes_, true, true};
 	}
 	batch_ = std::move(decoded);
 	condition_.notify_all();
@@ -506,7 +482,7 @@ arrow::Result<upload_input_ack> stream_input::publish(std::shared_ptr<arrow::Buf
 	if (cancelled_) {
 		return terminal_status_locked();
 	}
-	return upload_input_ack {acknowledged_batches_, acknowledged_rows_, acknowledged_bytes_, not_needed_, not_needed_};
+	return upload_input_ack{acknowledged_batches_, acknowledged_rows_, acknowledged_bytes_, not_needed_, not_needed_};
 }
 
 arrow::Result<upload_input_ack> stream_input::finish_upload(const std::function<bool()> &stopped) {
@@ -525,7 +501,7 @@ arrow::Result<upload_input_ack> stream_input::finish_upload(const std::function<
 	if (cancelled_) {
 		return terminal_status_locked();
 	}
-	return upload_input_ack {acknowledged_batches_, acknowledged_rows_, acknowledged_bytes_, true, not_needed_};
+	return upload_input_ack{acknowledged_batches_, acknowledged_rows_, acknowledged_bytes_, true, not_needed_};
 }
 
 void stream_input::detach() noexcept {
@@ -534,7 +510,7 @@ void stream_input::detach() noexcept {
 	condition_.notify_all();
 }
 
-std::shared_ptr<native_batch_view> stream_input::next_batch() {
+std::shared_ptr<sirius::offload::mo_native_batch> stream_input::next_batch() {
 	std::unique_lock lock(mutex_);
 	condition_.wait(lock, [&] { return batch_ || producer_eof_ || cancelled_ || not_needed_; });
 	if (cancelled_) {
@@ -587,7 +563,7 @@ arrow::Status stream_input::terminal_status_locked() const {
 }
 
 std::shared_ptr<stream_input> stream_input_registry::create(const sirius::offload::stream_read &request,
-                                                            const ::substrait::NamedStruct &schema) {
+															const ::substrait::NamedStruct &schema) {
 	auto input = std::make_shared<stream_input>(request, schema);
 	std::lock_guard lock(mutex_);
 	if (inputs_.size() >= k_max_stream_inputs) {
@@ -635,19 +611,13 @@ std::size_t stream_input_registry::size() const noexcept {
 	std::lock_guard lock(mutex_);
 	return inputs_.size();
 }
-std::size_t stream_input_registry::active_handlers() const noexcept {
-	return active_handlers_.load();
-}
-void stream_input_registry::handler_attached() noexcept {
-	active_handlers_.fetch_add(1);
-}
-void stream_input_registry::handler_detached() noexcept {
-	active_handlers_.fetch_sub(1);
-}
+std::size_t stream_input_registry::active_handlers() const noexcept { return active_handlers_.load(); }
+void stream_input_registry::handler_attached() noexcept { active_handlers_.fetch_add(1); }
+void stream_input_registry::handler_detached() noexcept { active_handlers_.fetch_sub(1); }
 
 duckdb::TableFunction get_stream_scan_function() {
 	duckdb::TableFunction function("mo_stream_scan", {duckdb::LogicalType::POINTER}, scan_stream, bind_stream,
-	                               init_stream);
+								   init_stream);
 	function.projection_pushdown = false;
 	function.filter_pushdown = false;
 	return function;

@@ -8,6 +8,7 @@ find_package(OpenSSL REQUIRED)
 
 set(EXTENSION_SOURCES
     src/config.cpp
+    src/native_result.cpp
     src/protocol.cpp
     src/stream_input.cpp
     src/tae_read_resolver.cpp
@@ -72,6 +73,7 @@ if(BUILD_UNITTESTS)
     mo_sidecar_stream_unittest
     test/unittest.cpp
     test/test_stream_input.cpp
+    src/native_result.cpp
     src/protocol.cpp
     src/stream_input.cpp)
   target_include_directories(
@@ -86,8 +88,10 @@ if(BUILD_UNITTESTS)
   target_link_libraries(
     mo_sidecar_stream_unittest
     Arrow::arrow_shared
+    ArrowFlight::arrow_flight_shared
     OpenSSL::Crypto
     duckdb_static
+    sirius_extension
     substrait_extension
     dummy_static_extension_loader)
   set_target_properties(
