@@ -187,7 +187,7 @@ TEST_CASE("MO native batch decoder validates and exposes borrowed vectors", "[si
 		malformed, matrixone::sidecar::native_batch_frame{1, std::string_view("bad")}, i64_schema()));
 }
 
-TEST_CASE("MO native input acknowledges only after complete consumption", "[sidecar][stream]") {
+TEST_CASE("MO native input acknowledges only when Sirius releases the current frame", "[sidecar][stream]") {
 	auto input = std::make_shared<matrixone::sidecar::stream_input>(stream_request(), i64_schema());
 	REQUIRE(input->attach().ok());
 	auto published =
@@ -201,6 +201,18 @@ TEST_CASE("MO native input acknowledges only after complete consumption", "[side
 	REQUIRE(ack->acknowledged_batches == 1);
 	REQUIRE(ack->rows == 2);
 	REQUIRE_FALSE(ack->complete);
+
+	auto prefetched = std::async(std::launch::async,
+		[&] { return input->publish(i64_frame(2, 30, 40), [] { return false; }); });
+	auto second = input->next_batch();
+	REQUIRE(second);
+	REQUIRE(second->sequence() == 2);
+	REQUIRE(prefetched.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout);
+	input->mark_consumed(second->sequence());
+	auto second_ack = prefetched.get();
+	REQUIRE(second_ack.ok());
+	REQUIRE(second_ack->acknowledged_batches == 2);
+	REQUIRE(second_ack->rows == 4);
 
 	auto finishing = std::async(std::launch::async, [&] { return input->finish_upload([] { return false; }); });
 	REQUIRE(input->next_batch() == nullptr);

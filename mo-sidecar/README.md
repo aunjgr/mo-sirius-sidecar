@@ -45,10 +45,11 @@ a separate sidecar, remote CN, production workload, or restart-recovery test.
   fallback before any offloaded result is exposed.
 - Each `StreamRead` uses a ticket-bound `DoPut` stream of framed MatrixOne
   `batch.Batch` payloads. Sirius maps `mo_stream_scan` to the GPU-native TAE
-  vector decoder. Input is acknowledged only after every referenced byte has
-  been copied into sidecar-owned staging; staging coalesces up to 32 MiB before
-  H2D and is hard-bounded at 96 MiB. Constant vectors retain a separate 64 MiB
-  per-input expansion bound.
+  vector decoder. One source task consumes one frame and copies it into one
+  final host representation with a 64 MiB expansion bound. Its acknowledgement
+  permits one following frame to occupy the sidecar prefetch slot; synchronized
+  H2D completion releases the Sirius source claim, and downstream demand alone
+  admits the prefetched frame.
 - `DoGet(ticket)` claims the ticket once and streams the same `MOB1` framing in
   the reverse direction. Results are encoded directly from Sirius data-batch
   representations, without a DuckDB `DataChunk` or Arrow record-batch hop.

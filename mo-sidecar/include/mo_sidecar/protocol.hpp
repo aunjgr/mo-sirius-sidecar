@@ -16,7 +16,7 @@ struct tae_read;
 
 namespace matrixone::sidecar {
 
-inline constexpr std::uint32_t k_protocol_version = 5;
+inline constexpr std::uint32_t k_protocol_version = 4;
 inline constexpr std::uint32_t k_tae_read_protocol_version = 2;
 inline constexpr std::uint32_t k_stream_read_protocol_version = 1;
 inline constexpr std::string_view k_substrait_version = "0.78.0";

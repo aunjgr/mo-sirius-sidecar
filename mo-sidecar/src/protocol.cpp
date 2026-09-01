@@ -16,7 +16,7 @@ namespace matrixone::sidecar {
 namespace {
 
 constexpr std::string_view k_capability_document =
-	"{\"protocol_version\":5,\"substrait_version\":\"0.78.0\","
+	"{\"protocol_version\":4,\"substrait_version\":\"0.78.0\","
 	"\"tae_read_protocol_version\":2,\"tae_read_feature_bits\":0,"
 	"\"stream_read_protocol_version\":1,\"stream_read_feature_bits\":0,"
 	"\"operators\":[\"read\",\"filter\",\"project\",\"aggregate\",\"sort\","
@@ -46,7 +46,9 @@ constexpr std::string_view k_capability_document =
 	"\"mo_native_endian\":\"little\","
 	"\"stream_input_ack\":\"ready-consumed-final-v1\","
 	"\"stream_input_slots_per_read\":1,"
+	"\"stream_input_frames_per_source_task\":1,"
 	"\"max_stream_inputs\":16,\"max_stream_input_batch_bytes\":4194304,"
+	"\"max_stream_input_expanded_bytes\":67108864,"
 	"\"sirius_execution_contract\":1,"
 	"\"max_plan_bytes\":16777216}";
 
