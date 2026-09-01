@@ -43,9 +43,25 @@ a separate sidecar, remote CN, production workload, or restart-recovery test.
   random, single-use 32-byte ticket. Preparation has already completed, so an
   `UNSUPPORTED_PLAN` response is safe for MatrixOne to classify for native
   fallback before any offloaded result is exposed.
-- `DoGet(ticket)` claims the ticket once and streams Arrow record batches.
-  Sirius's synchronous chunk callback and the Flight reader share a one-batch
-  queue; the producer cannot advance until the consumer releases that batch.
+- Each `StreamRead` uses a ticket-bound `DoPut` stream of framed MatrixOne
+  `batch.Batch` payloads. Sirius maps `mo_stream_scan` to the GPU-native TAE
+  vector decoder. One source task consumes one frame and copies it into one
+  final host representation with a 64 MiB expansion bound. Its acknowledgement
+  permits one following frame to occupy the sidecar prefetch slot; synchronized
+  H2D completion releases the Sirius source claim, and downstream demand alone
+  admits the prefetched frame.
+- `DoGet(ticket)` claims the ticket once and streams the same `MOB1` framing in
+  the reverse direction. Results are encoded directly from Sirius data-batch
+  representations, without a DuckDB `DataChunk` or Arrow record-batch hop.
+  Flight's mandatory leading message is an empty transport-only Arrow schema;
+  every later `FlightData.data_header` is the native `MOB1` frame itself because
+  Flight uses header presence as its end-of-stream sentinel. No result value is
+  encoded in Arrow; the exact result schema remains the MO-native value in
+  `FlightInfo.schema`.
+  Null-free fixed-width GPU results at or above 1 MiB are packed on GPU; small,
+  variable-width, null-bearing, or conversion-heavy results use the direct host
+  representation. `MO_SIDECAR_GPU_RESULT_PACK_MIN_BYTES` changes the threshold
+  and is clamped to 64 KiB–64 MiB.
 - `DoAction(CancelExecution)` accepts a strict `CancelExecutionRequest` with
   either the 32-byte ticket or the 32-byte preparation idempotency key. The
   latter closes the lost-`FlightInfo` case where MatrixOne cannot know whether
@@ -56,8 +72,9 @@ a separate sidecar, remote CN, production workload, or restart-recovery test.
 
 The authoritative protobuf source is
 [`proto/matrixone/sidecar/v1/sidecar.proto`](proto/matrixone/sidecar/v1/sidecar.proto).
-Substrait is pinned to `0.78.0`, the sidecar protocol to v2, and `TaeRead` to
-v1/features=0.
+Substrait is pinned to `0.78.0`, the sidecar protocol to v5, `TaeRead` to
+v2/features=0, and `StreamRead` to v1/features=0. Older protocol versions fail
+capability negotiation rather than being interpreted as native batches.
 
 ## Authenticated TAE resolution
 
@@ -85,9 +102,9 @@ fail-closed and are never classified as unsupported-plan fallback.
 Pending and running executions share the configured active-ticket bound.
 Deadlines are capped by `MO_SIDECAR_TICKET_TTL_MS`; a reaper interrupts expired
 DuckDB contexts even when a client never calls `DoGet`. Result memory is bounded
-by one negotiated Arrow batch plus the Sirius/DuckDB producer chunk. A batch
-larger than `max_batch_bytes` fails the execution rather than entering the
-Flight result buffer.
+by one negotiated MO-native frame plus its Sirius data batch. Oversized results
+are split by rows before encoding; a single row larger than `max_batch_bytes`
+fails the execution rather than entering the Flight result buffer.
 
 State transitions are monotonic:
 

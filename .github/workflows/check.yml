@@ -1,0 +1,57 @@
+name: Check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  native-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CONDA_OVERRIDE_CUDA: "13"
+      SCCACHE_GHA_ENABLED: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
+        with:
+          cache: false
+          pixi-version: v0.77.1
+          activate-environment: true
+
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Configure native sidecar
+        run: |
+          cmake -S duckdb -B build/debug-sidecar -G Ninja \
+            -DBUILD_UNITTESTS=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CUDA_ARCHITECTURES=75 \
+            -DEXTENSION_STATIC_BUILD=1 \
+            -DCMAKE_CXX_COMPILER="${CONDA_PREFIX}/bin/clang++" \
+            -DCMAKE_C_COMPILER="${CONDA_PREFIX}/bin/clang" \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DDUCKDB_EXTENSION_CONFIGS="${GITHUB_WORKSPACE}/extension_config_gpu.cmake"
+
+      - name: Build native sidecar and contracts
+        run: >-
+          cmake --build build/debug-sidecar --parallel
+          --target mo_sidecar_contract_unittest mo_sidecar_stream_unittest
+          mo_sidecar_loadable_extension
+
+      - name: Run protocol contract tests
+        run: build/debug-sidecar/extension/mo_sidecar/test/mo_sidecar_contract_unittest --abort
+
+      - name: Run native stream contract tests
+        run: build/debug-sidecar/extension/mo_sidecar/test/mo_sidecar_stream_unittest --abort

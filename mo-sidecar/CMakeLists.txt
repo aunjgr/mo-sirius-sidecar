@@ -8,7 +8,9 @@ find_package(OpenSSL REQUIRED)
 
 set(EXTENSION_SOURCES
     src/config.cpp
+    src/native_result.cpp
     src/protocol.cpp
+    src/stream_input.cpp
     src/tae_read_resolver.cpp
     src/flight_runtime.cpp
     src/mo_sidecar_extension.cpp)
@@ -26,6 +28,7 @@ foreach(_target mo_sidecar_extension mo_sidecar_loadable_extension)
   target_include_directories(
     ${_target}
     PRIVATE include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tae-scanner/include
             ${CMAKE_SOURCE_DIR}/third_party/httplib
             ${CMAKE_CURRENT_SOURCE_DIR}/../sirius/src/include
             ${CMAKE_CURRENT_SOURCE_DIR}/../sirius/substrait/src/include
@@ -62,6 +65,37 @@ if(BUILD_UNITTESTS)
   target_link_libraries(mo_sidecar_contract_unittest OpenSSL::Crypto)
   set_target_properties(
     mo_sidecar_contract_unittest
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test")
+
+  add_executable(
+    mo_sidecar_stream_unittest
+    test/unittest.cpp
+    test/test_stream_input.cpp
+    src/native_result.cpp
+    src/protocol.cpp
+    src/stream_input.cpp)
+  target_include_directories(
+    mo_sidecar_stream_unittest
+    PRIVATE include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tae-scanner/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../sirius/src/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../sirius/substrait/src/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../sirius/substrait/third_party
+            ${CMAKE_CURRENT_SOURCE_DIR}/../sirius/substrait/third_party/substrait
+            $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/third_party/catch>)
+  target_link_libraries(
+    mo_sidecar_stream_unittest
+    Arrow::arrow_shared
+    ArrowFlight::arrow_flight_shared
+    OpenSSL::Crypto
+    duckdb_static
+    sirius_extension
+    substrait_extension
+    dummy_static_extension_loader)
+  set_target_properties(
+    mo_sidecar_stream_unittest
     PROPERTIES CXX_STANDARD 20
                CXX_STANDARD_REQUIRED ON
                RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test")

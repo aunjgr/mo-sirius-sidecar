@@ -8,6 +8,7 @@
 #include "mo_sidecar/config.hpp"
 #include "mo_sidecar/flight_runtime.hpp"
 #include "mo_sidecar/protocol.hpp"
+#include "mo_sidecar/stream_input.hpp"
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -30,6 +31,7 @@ private:
 };
 
 void load_internal(ExtensionLoader &loader) {
+	loader.RegisterFunction(matrixone::sidecar::get_stream_scan_function());
 	const auto config = matrixone::sidecar::load_runtime_config();
 	if (!config) {
 		return;
