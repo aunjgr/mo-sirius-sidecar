@@ -123,6 +123,11 @@ std::optional<runtime_config> load_runtime_config() {
 	result.max_active_tickets = optional_integer<std::size_t>("MO_SIDECAR_MAX_ACTIVE_TICKETS", 128, 1, 4096);
 	result.max_batch_bytes = optional_integer<std::uint64_t>("MO_SIDECAR_MAX_BATCH_BYTES", 64U * 1024U * 1024U,
 	                                                         64U * 1024U, 1024U * 1024U * 1024U);
+	result.stream_input_capacity_bytes = optional_integer<std::uint64_t>(
+	    "MO_SIDECAR_STREAM_INPUT_CAPACITY_BYTES", 2ULL * 1024U * 1024U * 1024U, 64U * 1024U * 1024U,
+	    1ULL << 40U);
+	result.fatal_shutdown_grace_ms =
+	    optional_integer<std::uint64_t>("MO_SIDECAR_FATAL_SHUTDOWN_GRACE_MS", 5000, 100, 60000);
 	result.ticket_ttl_ms =
 	    optional_integer<std::uint64_t>("MO_SIDECAR_TICKET_TTL_MS", 15U * 60U * 1000U, 1000, 20U * 60U * 1000U);
 

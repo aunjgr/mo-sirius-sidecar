@@ -49,6 +49,9 @@ constexpr std::string_view k_capability_document =
 	"\"stream_input_frames_per_source_task\":1,"
 	"\"max_stream_inputs\":16,\"max_stream_input_batch_bytes\":4194304,"
 	"\"max_stream_input_expanded_bytes\":67108864,"
+	"\"stream_input_host_accounting\":\"pre-admitted-execution-v2\","
+	"\"gpu_fatal_recovery\":\"process-fail-stop-v1\","
+	"\"gpu_partition_concurrency\":\"same-stage-reentrant-v1\","
 	"\"sirius_execution_contract\":1,"
 	"\"max_plan_bytes\":16777216}";
 

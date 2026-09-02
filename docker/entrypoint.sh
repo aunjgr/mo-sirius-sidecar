@@ -182,5 +182,26 @@ wait -n "$MO_PID" "$SIDECAR_PID"
 EXIT_CODE=$?
 set -e
 
+if [ "${EXIT_CODE}" -eq 70 ] && ! kill -0 "$SIDECAR_PID" 2>/dev/null; then
+    # GPU-fatal fail-stop deliberately exits the sidecar generation. Restart
+    # the paired MO+sidecar process generation with capped exponential backoff;
+    # no old ticket or CUDA owner survives the exec boundary.
+    RESTART_ATTEMPT="${MO_SIDECAR_RESTART_ATTEMPT:-0}"
+    if [ "${RESTART_ATTEMPT}" -ge 5 ]; then
+        RESTART_DELAY=30
+    else
+        RESTART_DELAY=$((1 << RESTART_ATTEMPT))
+    fi
+    NEXT_ATTEMPT=$((RESTART_ATTEMPT + 1))
+    echo "[entrypoint] GPU-fatal sidecar exit; restarting paired generation in ${RESTART_DELAY}s."
+    exec 9>&- 2>/dev/null || true
+    kill -INT "$MO_PID" 2>/dev/null || true
+    wait "$MO_PID" 2>/dev/null || true
+    sleep "${RESTART_DELAY}"
+    trap - EXIT
+    export MO_SIDECAR_RESTART_ATTEMPT="${NEXT_ATTEMPT}"
+    exec /entrypoint.sh
+fi
+
 echo "[entrypoint] A process exited (code=$EXIT_CODE), shutting down."
 exit $EXIT_CODE
