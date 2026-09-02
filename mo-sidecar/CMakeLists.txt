@@ -10,6 +10,7 @@ set(EXTENSION_SOURCES
     src/config.cpp
     src/native_result.cpp
     src/protocol.cpp
+    src/stream_admission.cpp
     src/stream_input.cpp
     src/tae_read_resolver.cpp
     src/flight_runtime.cpp
@@ -55,8 +56,10 @@ if(BUILD_UNITTESTS)
     mo_sidecar_contract_unittest
     test/unittest.cpp
     test/test_protocol.cpp
+    test/test_stream_admission.cpp
     src/config.cpp
-    src/protocol.cpp)
+    src/protocol.cpp
+    src/stream_admission.cpp)
   target_include_directories(
     mo_sidecar_contract_unittest
     PRIVATE include

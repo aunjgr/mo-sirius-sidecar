@@ -5,6 +5,7 @@
 
 #include "mo_sidecar/native_result.hpp"
 #include "mo_sidecar/protocol.hpp"
+#include "mo_sidecar/stream_admission.hpp"
 #include "mo_sidecar/stream_input.hpp"
 #include "mo_sidecar/tae_read_resolver.hpp"
 
@@ -57,6 +58,8 @@ arrow::Status substrait_error(const sirius::offload::substrait_execution_error &
 		return flight_error(flight::FlightStatusCode::Cancelled, error.what(), "CANCELLED");
 	case code::EXECUTION_FAILED:
 		return flight_error(flight::FlightStatusCode::Internal, error.what(), "EXECUTION_FAILED");
+	case code::GPU_DEVICE_UNAVAILABLE:
+		return flight_error(flight::FlightStatusCode::Unavailable, error.what(), "GPU_DEVICE_UNAVAILABLE");
 	}
 	return flight_error(flight::FlightStatusCode::Internal, "unknown Sirius execution error");
 }
@@ -74,11 +77,14 @@ class ticket_registry;
 class execution_entry final : public std::enable_shared_from_this<execution_entry> {
   public:
 	using terminal_callback = std::function<void(const std::string &)>;
+	using fatal_callback = std::function<void()>;
 
 	execution_entry(duckdb::DatabaseInstance &database, const runtime_config &config, execute_request request,
-					std::string ticket, terminal_callback on_terminal)
-		: config_(config), request_(std::move(request)), ticket_(std::move(ticket)),
-		  on_terminal_(std::move(on_terminal)), connection_(std::make_unique<duckdb::Connection>(database)),
+					std::string ticket, stream_admission_controller::lease admission_lease,
+					terminal_callback on_terminal, fatal_callback on_fatal)
+		: admission_lease_(std::move(admission_lease)), config_(config), request_(std::move(request)),
+		  ticket_(std::move(ticket)), on_terminal_(std::move(on_terminal)), on_fatal_(std::move(on_fatal)),
+		  connection_(std::make_unique<duckdb::Connection>(database)),
 		  evidence_(std::make_shared<sirius::execution_evidence>(sirius::execution_backend::SIRIUS_GPU)) {
 		// Resolution creates query-local views that binding and execution must
 		// observe in one transaction. The entry owns the connection through
@@ -108,6 +114,8 @@ class execution_entry final : public std::enable_shared_from_this<execution_entr
 	std::uint64_t deadline_unix_ms() const noexcept { return request_.deadline_unix_ms; }
 	const std::string &idempotency_key() const noexcept { return request_.idempotency_key; }
 	std::uint64_t max_input_batch_bytes() const noexcept { return request_.max_input_batch_bytes; }
+	std::size_t stream_input_count() const noexcept { return stream_inputs_.size(); }
+	void shrink_admission() { admission_lease_.shrink(stream_execution_charge(request_, stream_input_count())); }
 
 	arrow::Result<std::shared_ptr<stream_input>> attach_input(const std::string &stream_ref) {
 		auto input = stream_inputs_.find(stream_ref);
@@ -221,6 +229,33 @@ class execution_entry final : public std::enable_shared_from_this<execution_entr
 		return true;
 	}
 
+	void fail_gpu_unavailable() noexcept {
+		bool unstarted = false;
+		{
+			std::lock_guard lock(mutex_);
+			if (quiesced_) {
+				return;
+			}
+			if (!terminal_) {
+				terminal_ = true;
+				terminal_status_ = flight_error(flight::FlightStatusCode::Unavailable,
+										  "sidecar GPU generation is unavailable", "GPU_DEVICE_UNAVAILABLE");
+				frame_.reset();
+			}
+			unstarted = !worker_.joinable();
+		}
+		stream_inputs_.cancel_all("sidecar GPU generation is unavailable");
+		execution_->cancel();
+		connection_->Interrupt();
+		(void)evidence_->finish(sirius::execution_outcome::FAILED);
+		if (unstarted) {
+			std::lock_guard lock(mutex_);
+			quiesced_ = true;
+		}
+		condition_.notify_all();
+		maybe_notify_terminal();
+	}
+
 	bool cancel_and_join(bool timed_out, const std::function<bool()> &stop_waiting = {}) {
 		(void)cancel(timed_out);
 		const auto deadline =
@@ -301,6 +336,9 @@ class execution_entry final : public std::enable_shared_from_this<execution_entr
 			execution_->run_batches([this](const auto &batch, auto stream) { return consume_batch(batch, stream); });
 		} catch (const sirius::offload::substrait_execution_error &error) {
 			status = substrait_error(error);
+			if (error.code() == sirius::offload::substrait_error_code::GPU_DEVICE_UNAVAILABLE && on_fatal_) {
+				on_fatal_();
+			}
 			outcome = error.code() == sirius::offload::substrait_error_code::CANCELLED
 						  ? sirius::execution_outcome::CANCELLED
 						  : sirius::execution_outcome::FAILED;
@@ -349,10 +387,13 @@ class execution_entry final : public std::enable_shared_from_this<execution_entr
 		}
 	}
 
+	// Released last, after execution, handlers, result state, and connection.
+	stream_admission_controller::lease admission_lease_;
 	const runtime_config &config_;
 	execute_request request_;
 	std::string ticket_;
 	terminal_callback on_terminal_;
+	fatal_callback on_fatal_;
 	stream_input_registry stream_inputs_;
 
 	// Destruction is reverse declaration order: execution (and its resolution
@@ -431,24 +472,35 @@ class native_result_stream final : public flight::FlightDataStream {
 
 class ticket_registry final {
   public:
-	ticket_registry(duckdb::DatabaseInstance &database, const runtime_config &config)
-		: database_(database), config_(config), reaper_([this] { reap(); }) {}
+	ticket_registry(duckdb::DatabaseInstance &database, const runtime_config &config,
+					 std::function<void()> on_gpu_fatal)
+		: database_(database), config_(config), admission_(config.stream_input_capacity_bytes),
+		  on_gpu_fatal_(std::move(on_gpu_fatal)), reaper_([this] { reap(); }) {}
 
 	~ticket_registry() { shutdown(); }
 
 	arrow::Result<std::shared_ptr<execution_entry>> prepare(execute_request request) {
 		std::shared_ptr<execution_entry> existing;
+		std::optional<stream_admission_controller::lease> admission_lease;
 		{
 			std::unique_lock lock(mutex_);
 			while (true) {
 				if (stopped_) {
-					return flight_error(flight::FlightStatusCode::Unavailable, "sidecar is stopping");
+					return flight_error(flight::FlightStatusCode::Unavailable,
+										gpu_unavailable_ ? "sidecar GPU generation is unavailable" : "sidecar is stopping",
+										gpu_unavailable_ ? "GPU_DEVICE_UNAVAILABLE" : "");
 				}
 				const auto idempotency = idempotency_.find(request.idempotency_key);
 				if (idempotency == idempotency_.end()) {
 					if (entries_.size() + reserved_ >= config_.max_active_tickets) {
 						return flight_error(flight::FlightStatusCode::Unavailable,
 											"sidecar active ticket limit reached", "RESOURCE_EXHAUSTED");
+					}
+					admission_lease =
+						admission_.try_acquire(stream_execution_charge(request, k_max_stream_inputs));
+					if (!admission_lease) {
+						return flight_error(flight::FlightStatusCode::Unavailable,
+											"sidecar streamed-input capacity exhausted", "RESOURCE_EXHAUSTED");
 					}
 					++reserved_;
 					idempotency_.emplace(request.idempotency_key,
@@ -502,20 +554,24 @@ class ticket_registry final {
 				ticket = random_ticket();
 			} while (contains(ticket));
 			entry = std::make_shared<execution_entry>(
-				database_, config_, std::move(request), ticket,
-				[this](const std::string &completed_ticket) { remove(completed_ticket); });
+				database_, config_, std::move(request), ticket, std::move(*admission_lease),
+				[this](const std::string &completed_ticket) { remove(completed_ticket); },
+				[this] { notify_gpu_fatal(); });
+			entry->shrink_admission();
 		} catch (...) {
 			release_reservation(idempotency_key);
 			throw;
 		}
 
 		bool stopping = false;
+		bool gpu_unavailable = false;
 		bool cancel_requested = false;
 		{
 			std::lock_guard lock(mutex_);
 			--reserved_;
 			if (stopped_) {
 				stopping = true;
+				gpu_unavailable = gpu_unavailable_;
 				idempotency_.erase(idempotency_key);
 			} else {
 				entries_.emplace(entry->ticket(), entry);
@@ -529,6 +585,11 @@ class ticket_registry final {
 		// cancel() calls the registry's terminal callback, so it must never run
 		// while mutex_ is held.
 		if (stopping) {
+			if (gpu_unavailable) {
+				entry->fail_gpu_unavailable();
+				return flight_error(flight::FlightStatusCode::Unavailable,
+									"sidecar GPU generation is unavailable", "GPU_DEVICE_UNAVAILABLE");
+			}
 			entry->cancel(false);
 			return flight_error(flight::FlightStatusCode::Unavailable, "sidecar is stopping");
 		}
@@ -538,6 +599,32 @@ class ticket_registry final {
 								"CANCELLED");
 		}
 		return entry;
+	}
+
+	bool gpu_healthy() const noexcept {
+		std::lock_guard lock(mutex_);
+		return !gpu_unavailable_;
+	}
+
+	bool seal_gpu_unavailable() noexcept {
+		std::vector<std::shared_ptr<execution_entry>> entries;
+		{
+			std::lock_guard lock(mutex_);
+			if (gpu_unavailable_) {
+				return false;
+			}
+			gpu_unavailable_ = true;
+			stopped_ = true;
+			for (const auto &[_, entry] : entries_) {
+				entries.push_back(entry);
+			}
+		}
+		wake_.notify_all();
+		state_changed_.notify_all();
+		for (const auto &entry : entries) {
+			entry->fail_gpu_unavailable();
+		}
+		return true;
 	}
 
 	std::shared_ptr<execution_entry> claim(const std::string &ticket) {
@@ -660,6 +747,12 @@ class ticket_registry final {
 	}
 
   private:
+	void notify_gpu_fatal() noexcept {
+		if (seal_gpu_unavailable() && on_gpu_fatal_) {
+			on_gpu_fatal_();
+		}
+	}
+
 	bool contains(const std::string &ticket) {
 		std::lock_guard lock(mutex_);
 		return entries_.contains(ticket);
@@ -706,7 +799,9 @@ class ticket_registry final {
 
 	duckdb::DatabaseInstance &database_;
 	const runtime_config &config_;
-	std::mutex mutex_;
+	stream_admission_controller admission_;
+	std::function<void()> on_gpu_fatal_;
+	mutable std::mutex mutex_;
 	std::condition_variable wake_;
 	std::condition_variable state_changed_;
 	std::unordered_map<std::string, std::shared_ptr<execution_entry>> entries_;
@@ -720,6 +815,7 @@ class ticket_registry final {
 	std::unordered_map<std::string, idempotency_record> idempotency_;
 	std::size_t reserved_ = 0;
 	bool stopped_ = false;
+	bool gpu_unavailable_ = false;
 	std::thread reaper_;
 };
 
@@ -739,14 +835,19 @@ class input_handler_guard final {
 
 class sidecar_flight_server final : public flight::FlightServerBase {
   public:
-	sidecar_flight_server(duckdb::DatabaseInstance &database, const runtime_config &config)
-		: config_(config), registry_(database, config) {}
+	sidecar_flight_server(duckdb::DatabaseInstance &database, const runtime_config &config,
+					  std::function<void()> on_gpu_fatal)
+		: config_(config), registry_(database, config, std::move(on_gpu_fatal)) {}
 
 	void stop_registry() noexcept { registry_.shutdown(); }
 	void stop_admission() noexcept { registry_.stop_admission_and_cancel(); }
 
 	arrow::Status GetFlightInfo(const flight::ServerCallContext &context, const flight::FlightDescriptor &descriptor,
 								std::unique_ptr<flight::FlightInfo> *info) override {
+		if (!registry_.gpu_healthy()) {
+			return flight_error(flight::FlightStatusCode::Unavailable,
+								"sidecar GPU generation is unavailable", "GPU_DEVICE_UNAVAILABLE");
+		}
 		if (descriptor.type != flight::FlightDescriptor::CMD) {
 			return arrow::Status::Invalid("ExecuteSubstrait requires a command descriptor");
 		}
@@ -811,6 +912,10 @@ class sidecar_flight_server final : public flight::FlightServerBase {
 
 	arrow::Status DoGet(const flight::ServerCallContext &context, const flight::Ticket &request,
 						std::unique_ptr<flight::FlightDataStream> *stream) override {
+		if (!registry_.gpu_healthy()) {
+			return flight_error(flight::FlightStatusCode::Unavailable,
+								"sidecar GPU generation is unavailable", "GPU_DEVICE_UNAVAILABLE");
+		}
 		auto entry = registry_.claim(request.ticket);
 		if (!entry) {
 			return arrow::Status::KeyError("unknown, expired, or already claimed ticket");
@@ -821,6 +926,10 @@ class sidecar_flight_server final : public flight::FlightServerBase {
 
 	arrow::Status DoPut(const flight::ServerCallContext &context, std::unique_ptr<flight::FlightMessageReader> reader,
 						std::unique_ptr<flight::FlightMetadataWriter> writer) override {
+		if (!registry_.gpu_healthy()) {
+			return flight_error(flight::FlightStatusCode::Unavailable,
+								"sidecar GPU generation is unavailable", "GPU_DEVICE_UNAVAILABLE");
+		}
 		std::shared_ptr<execution_entry> entry;
 		try {
 			if (!reader || !writer || reader->descriptor().type != flight::FlightDescriptor::CMD) {
@@ -910,6 +1019,10 @@ class sidecar_flight_server final : public flight::FlightServerBase {
 						   std::unique_ptr<flight::ResultStream> *result) override {
 		std::vector<flight::Result> results;
 		if (action.type == "GetCapabilities") {
+			if (!registry_.gpu_healthy()) {
+				return flight_error(flight::FlightStatusCode::Unavailable,
+									"sidecar GPU generation is unavailable", "GPU_DEVICE_UNAVAILABLE");
+			}
 			if (action.body && action.body->size() != 0) {
 				return arrow::Status::Invalid("GetCapabilities body must be empty");
 			}
@@ -952,13 +1065,29 @@ class sidecar_flight_server final : public flight::FlightServerBase {
 class flight_runtime::impl {
   public:
 	impl(duckdb::DatabaseInstance &database, runtime_config config)
-		: config(std::move(config)), server(database, this->config) {}
+		: config(std::move(config)), server(database, this->config, [this] { begin_fatal_shutdown(); }) {}
+
+	void begin_fatal_shutdown() noexcept {
+		bool expected = false;
+		if (!fatal_shutdown_started.compare_exchange_strong(expected, true)) {
+			return;
+		}
+		fatal_thread = std::thread([this] {
+			const auto deadline = std::chrono::system_clock::now() +
+								  std::chrono::milliseconds(config.fatal_shutdown_grace_ms);
+			const auto status = server.Shutdown(&deadline);
+			(void)status;
+			std::_Exit(70);
+		});
+	}
 
 	runtime_config config;
 	sidecar_flight_server server;
 	std::thread server_thread;
+	std::thread fatal_thread;
 	std::mutex stop_mutex;
 	std::atomic<bool> started{false};
+	std::atomic<bool> fatal_shutdown_started{false};
 };
 
 flight_runtime::flight_runtime(duckdb::DatabaseInstance &database, runtime_config config)

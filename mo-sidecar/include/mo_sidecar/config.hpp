@@ -28,6 +28,8 @@ struct runtime_config {
 	std::string read_client_key_path;
 	std::size_t max_active_tickets = 128;
 	std::uint64_t max_batch_bytes = 64U * 1024U * 1024U;
+	std::uint64_t stream_input_capacity_bytes = 2ULL * 1024U * 1024U * 1024U;
+	std::uint64_t fatal_shutdown_grace_ms = 5000;
 	std::uint64_t ticket_ttl_ms = 15U * 60U * 1000U;
 };
 

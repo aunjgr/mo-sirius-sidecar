@@ -269,9 +269,15 @@ TEST_CASE("HTTPS endpoint parsing fails closed", "[sidecar][config]") {
 }
 
 TEST_CASE("Capability document has a stable SHA-256", "[sidecar][protocol]") {
+	REQUIRE(matrixone::sidecar::capability_document().find("pre-admitted-execution-v2") !=
+			std::string_view::npos);
+	REQUIRE(matrixone::sidecar::capability_document().find("process-fail-stop-v1") !=
+			std::string_view::npos);
+	REQUIRE(matrixone::sidecar::capability_document().find("same-stage-reentrant-v1") !=
+			std::string_view::npos);
 	REQUIRE(matrixone::sidecar::capability_hash().size() == 32);
 	REQUIRE(matrixone::sidecar::hex(matrixone::sidecar::capability_hash()) ==
-				"bdbe2509d6519bcbf184e07ef897123a76e3a016855fd5dc889858b0f9c6800a");
+				"32f14380770bf4016cbf1b0f564e4423421f6b86779018e9dfcb7aba94f67ea7");
 	REQUIRE(matrixone::sidecar::sha256_bytes(matrixone::sidecar::capability_document()) ==
 			matrixone::sidecar::capability_hash());
 }

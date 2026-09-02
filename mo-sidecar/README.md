@@ -72,7 +72,7 @@ a separate sidecar, remote CN, production workload, or restart-recovery test.
 
 The authoritative protobuf source is
 [`proto/matrixone/sidecar/v1/sidecar.proto`](proto/matrixone/sidecar/v1/sidecar.proto).
-Substrait is pinned to `0.78.0`, the sidecar protocol to v5, `TaeRead` to
+Substrait is pinned to `0.78.0`, the sidecar protocol to v4, `TaeRead` to
 v2/features=0, and `StreamRead` to v1/features=0. Older protocol versions fail
 capability negotiation rather than being interpreted as native batches.
 
@@ -100,6 +100,13 @@ fail-closed and are never classified as unsupported-plan fallback.
 ## Bounded lifecycle
 
 Pending and running executions share the configured active-ticket bound.
+Before a ticket is published they also reserve a process-global byte lease
+from `MO_SIDECAR_STREAM_INPUT_CAPACITY_BYTES` (2 GiB by default). The lease
+conservatively covers input transport overlap, each resolved StreamRead's
+64 MiB host representation, result overlap, and request/schema retention.
+Admission fails with `RESOURCE_EXHAUSTED` before MatrixOne producers start;
+the lease is released only after the worker and every input handler quiesce.
+
 Deadlines are capped by `MO_SIDECAR_TICKET_TTL_MS`; a reaper interrupts expired
 DuckDB contexts even when a client never calls `DoGet`. Result memory is bounded
 by one negotiated MO-native frame plus its Sirius data batch. Oversized results
@@ -117,6 +124,12 @@ prepared -> claimed/running -> succeeded | failed | cancelled | expired
 The first terminal transition wins. Registry removal does not destroy a
 running stream: the Flight reader and worker retain the execution until the
 worker has stopped and the resolution tokens have been released.
+
+A CUDA stream-quiescence failure seals Flight admission, makes
+`GetCapabilities` and every ticket return `GPU_DEVICE_UNAVAILABLE`, and exits
+the sidecar with status 70 after `MO_SIDECAR_FATAL_SHUTDOWN_GRACE_MS` (5 seconds
+by default). The bundled entrypoint restarts the paired process generation with
+exponential backoff capped at 30 seconds; no CUDA stream or ticket is reused.
 
 ## Validation
 
